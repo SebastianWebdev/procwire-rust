@@ -1,0 +1,47 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+*.pdb
+
+# Cargo lock (library - let consumers resolve)
+# Uncomment if this becomes a binary:
+# Cargo.lock
+
+# Editors
+.idea
+.vscode
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Agent session memory (local only)
+AGENT_MEMORY.md
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Coverage
+*.profraw
+*.profdata
+lcov.info
+coverage/
+tarpaulin-report.html
+
+# Benchmark results (local)
+criterion/
+
+# Environment
+.env
+.env.local
+
+
+# Added by cargo
+#
+# already existing elements were commented out
+
+#/target
