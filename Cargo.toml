@@ -2,11 +2,22 @@
 name = "procwire-client"
 version = "0.1.0"
 edition = "2021"
-description = "Rust client SDK for Procwire IPC — high-performance binary protocol"
+description = "Rust client SDK for Procwire IPC — high-performance binary protocol for Node.js ↔ Rust communication"
 license = "MIT"
-keywords = ["ipc", "binary-protocol", "process-communication"]
-categories = ["network-programming"]
+keywords = ["ipc", "binary-protocol", "process-communication", "msgpack", "nodejs"]
+categories = ["network-programming", "asynchronous"]
 rust-version = "1.75"
+repository = "https://github.com/SebastianWebdev/procwire-client-rs"
+homepage = "https://github.com/SebastianWebdev/procwire-client-rs"
+documentation = "https://docs.rs/procwire-client"
+readme = "README.md"
+authors = ["Sebastian Webdev"]
+exclude = [
+    "docs/",
+    "AGENT_MEMORY.md",
+    "CLAUDE.md",
+    ".github/",
+]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
