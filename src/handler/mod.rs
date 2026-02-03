@@ -29,5 +29,5 @@
 mod context;
 mod registry;
 
-pub use context::{shared_writer, RawPayload, RequestContext, SharedWriter};
+pub use context::{RawPayload, RequestContext};
 pub use registry::{BoxFuture, Handler, HandlerRegistry, HandlerResult, TypedHandler};

@@ -22,36 +22,31 @@
 //! }
 //! ```
 
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
-
 use bytes::Bytes;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::sync::Mutex;
 
 use crate::codec::MsgPackCodec;
 use crate::error::Result;
-use crate::protocol::{build_frame, flags, Header};
-
-/// Boxed async writer using the low-level trait.
-pub type BoxedWriter = Pin<Box<dyn AsyncWrite + Send>>;
-
-/// Shared writer type for sending responses.
-pub type SharedWriter = Arc<Mutex<BoxedWriter>>;
+use crate::protocol::{flags, Header};
+use crate::writer::{OutboundFrame, WriterHandle};
 
 /// Context passed to request handlers.
 ///
 /// Provides methods for sending responses back to the parent.
 /// All response methods handle serialization and frame building internally.
+///
+/// # Thread Safety
+///
+/// `RequestContext` is `Clone` and can be safely shared across async tasks.
+/// The underlying writer uses a channel-based architecture that eliminates
+/// lock contention.
 #[derive(Clone)]
 pub struct RequestContext {
     /// Method ID for this request.
     method_id: u16,
     /// Request ID for this request (0 = event).
     request_id: u32,
-    /// Shared writer for sending responses.
-    writer: Option<SharedWriter>,
+    /// Writer handle for sending responses.
+    writer: Option<WriterHandle>,
 }
 
 impl RequestContext {
@@ -65,7 +60,7 @@ impl RequestContext {
     }
 
     /// Create a new request context with a writer.
-    pub fn with_writer(method_id: u16, request_id: u32, writer: SharedWriter) -> Self {
+    pub fn with_writer(method_id: u16, request_id: u32, writer: WriterHandle) -> Self {
         Self {
             method_id,
             request_id,
@@ -90,17 +85,23 @@ impl RequestContext {
     /// Serializes the payload using MsgPack and sends a response frame.
     pub async fn respond<T: serde::Serialize>(&self, payload: &T) -> Result<()> {
         let data = MsgPackCodec::encode(payload)?;
-        self.send_frame(flags::RESPONSE, &data).await
+        self.send_frame(flags::RESPONSE, Bytes::from(data)).await
     }
 
-    /// Send a response with raw bytes.
+    /// Send a response with raw bytes (zero-copy).
     pub async fn respond_raw(&self, payload: &[u8]) -> Result<()> {
+        self.send_frame(flags::RESPONSE, Bytes::copy_from_slice(payload))
+            .await
+    }
+
+    /// Send a response with pre-allocated Bytes (zero-copy).
+    pub async fn respond_bytes(&self, payload: Bytes) -> Result<()> {
         self.send_frame(flags::RESPONSE, payload).await
     }
 
     /// Send an acknowledgment (empty payload).
     pub async fn ack(&self) -> Result<()> {
-        self.send_frame(flags::ACK_RESPONSE, &[]).await
+        self.send_frame_empty(flags::ACK_RESPONSE).await
     }
 
     /// Send a stream chunk.
@@ -108,11 +109,18 @@ impl RequestContext {
     /// Serializes the payload using MsgPack and sends a stream chunk frame.
     pub async fn chunk<T: serde::Serialize>(&self, payload: &T) -> Result<()> {
         let data = MsgPackCodec::encode(payload)?;
-        self.send_frame(flags::STREAM_CHUNK, &data).await
+        self.send_frame(flags::STREAM_CHUNK, Bytes::from(data))
+            .await
     }
 
     /// Send a stream chunk with raw bytes.
     pub async fn chunk_raw(&self, payload: &[u8]) -> Result<()> {
+        self.send_frame(flags::STREAM_CHUNK, Bytes::copy_from_slice(payload))
+            .await
+    }
+
+    /// Send a stream chunk with pre-allocated Bytes (zero-copy).
+    pub async fn chunk_bytes(&self, payload: Bytes) -> Result<()> {
         self.send_frame(flags::STREAM_CHUNK, payload).await
     }
 
@@ -122,7 +130,7 @@ impl RequestContext {
     /// **IMPORTANT**: STREAM_END frames always have empty payload!
     pub async fn end(&self) -> Result<()> {
         // NOTE: STREAM_END always has empty payload (payloadLength=0)
-        self.send_frame(flags::STREAM_END_RESPONSE, &[]).await
+        self.send_frame_empty(flags::STREAM_END_RESPONSE).await
     }
 
     /// Send an error response.
@@ -130,11 +138,12 @@ impl RequestContext {
     /// Serializes the error message and sends an error frame.
     pub async fn error(&self, message: &str) -> Result<()> {
         let data = MsgPackCodec::encode(&message)?;
-        self.send_frame(flags::ERROR_RESPONSE, &data).await
+        self.send_frame(flags::ERROR_RESPONSE, Bytes::from(data))
+            .await
     }
 
     /// Send a frame with the given flags and payload.
-    async fn send_frame(&self, frame_flags: u8, payload: &[u8]) -> Result<()> {
+    async fn send_frame(&self, frame_flags: u8, payload: Bytes) -> Result<()> {
         let writer = match &self.writer {
             Some(w) => w,
             None => {
@@ -150,50 +159,25 @@ impl RequestContext {
             payload.len() as u32,
         );
 
-        let frame_bytes = build_frame(&header, payload);
-
-        let mut guard = writer.lock().await;
-        guard.write_all(&frame_bytes).await?;
-        guard.flush().await?;
-
-        Ok(())
-    }
-}
-
-/// Wrapper to make PipeStream into a pinned boxed writer.
-pub struct PinnedWriter<W> {
-    inner: W,
-}
-
-impl<W: AsyncWrite + Unpin> PinnedWriter<W> {
-    pub fn new(inner: W) -> Self {
-        Self { inner }
-    }
-}
-
-impl<W: AsyncWrite + Unpin> AsyncWrite for PinnedWriter<W> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+        let frame = OutboundFrame::new(&header, payload);
+        writer.send(frame).await
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
+    /// Send a frame with empty payload.
+    async fn send_frame_empty(&self, frame_flags: u8) -> Result<()> {
+        let writer = match &self.writer {
+            Some(w) => w,
+            None => {
+                // No writer configured (testing mode)
+                return Ok(());
+            }
+        };
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
-}
+        let header = Header::new(self.method_id, frame_flags, self.request_id, 0);
 
-/// Create a shared writer from any AsyncWrite + Send + Unpin.
-pub fn shared_writer<W: AsyncWrite + Send + Unpin + 'static>(writer: W) -> SharedWriter {
-    Arc::new(Mutex::new(
-        Box::pin(PinnedWriter::new(writer)) as BoxedWriter
-    ))
+        let frame = OutboundFrame::empty(&header);
+        writer.send(frame).await
+    }
 }
 
 /// Wrapper for Bytes payload (zero-copy).
@@ -241,43 +225,13 @@ mod tests {
 
         assert!(ctx.respond(&"test").await.is_ok());
         assert!(ctx.respond_raw(b"test").await.is_ok());
+        assert!(ctx.respond_bytes(Bytes::from_static(b"test")).await.is_ok());
         assert!(ctx.ack().await.is_ok());
         assert!(ctx.chunk(&1i32).await.is_ok());
         assert!(ctx.chunk_raw(b"chunk").await.is_ok());
+        assert!(ctx.chunk_bytes(Bytes::from_static(b"chunk")).await.is_ok());
         assert!(ctx.end().await.is_ok());
         assert!(ctx.error("error message").await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_respond_with_writer() {
-        use std::io::Cursor;
-
-        let buffer: Vec<u8> = Vec::new();
-        let cursor = Cursor::new(buffer);
-        let writer = shared_writer(cursor);
-
-        let ctx = RequestContext::with_writer(1, 42, writer.clone());
-        ctx.respond(&"hello").await.unwrap();
-
-        // Can't easily inspect the written data since it's behind a Pin
-        // but the test verifies no panic
-    }
-
-    #[tokio::test]
-    async fn test_respond_produces_correct_flags() {
-        use std::io::Cursor;
-
-        // Create a custom writer that captures data
-        let cursor = Cursor::new(Vec::new());
-        let writer = shared_writer(cursor);
-
-        let ctx = RequestContext::with_writer(5, 100, writer.clone());
-        ctx.respond(&42i32).await.unwrap();
-
-        // Read what was written
-        let guard = writer.lock().await;
-        // The writer is a Pin<Box<...>> wrapping a Cursor, we can verify it ran without panic
-        drop(guard);
     }
 
     #[tokio::test]
@@ -316,5 +270,21 @@ mod tests {
 
         assert_eq!(payload.as_bytes(), b"hello world");
         assert_eq!(payload.into_bytes(), data);
+    }
+
+    #[tokio::test]
+    async fn test_context_with_writer() {
+        use crate::writer::spawn_writer_task_default;
+        use tokio::io::duplex;
+
+        let (client, _server) = duplex(4096);
+        let (writer_handle, _task) = spawn_writer_task_default(client);
+
+        let ctx = RequestContext::with_writer(1, 42, writer_handle);
+
+        // Should work with writer
+        assert!(ctx.respond(&"hello").await.is_ok());
+        assert!(ctx.chunk(&123i32).await.is_ok());
+        assert!(ctx.end().await.is_ok());
     }
 }

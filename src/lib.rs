@@ -29,14 +29,15 @@
 //! }
 //! ```
 
+pub mod backpressure;
 pub mod codec;
 pub mod control;
 pub mod error;
 pub mod handler;
 pub mod protocol;
 pub mod transport;
+pub mod writer;
 
-mod backpressure;
 mod client;
 
 pub use client::{Client, ClientBuilder};

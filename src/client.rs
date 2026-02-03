@@ -36,16 +36,21 @@
 use std::future::Future;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use serde::de::DeserializeOwned;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Semaphore};
+use tokio::task::JoinHandle;
 
 use crate::codec::MsgPackCodec;
 use crate::control::{build_init_message, write_stdout_line, ResponseType};
 use crate::error::{ProcwireError, Result};
-use crate::handler::{shared_writer, HandlerRegistry, HandlerResult, RequestContext, SharedWriter};
-use crate::protocol::{build_frame, flags, FrameBuffer, Header, ABORT_METHOD_ID};
+use crate::handler::{HandlerRegistry, HandlerResult, RequestContext};
+use crate::protocol::{flags, FrameBuffer, Header, ABORT_METHOD_ID};
 use crate::transport::{generate_pipe_path, PipeListener};
+use crate::writer::{spawn_writer_task, OutboundFrame, WriterConfig, WriterHandle};
+
+/// Default maximum concurrent handlers.
+pub const DEFAULT_MAX_CONCURRENT_HANDLERS: usize = 256;
 
 /// Builder for configuring and creating a Procwire client.
 ///
@@ -53,6 +58,8 @@ use crate::transport::{generate_pipe_path, PipeListener};
 /// to begin the client lifecycle.
 pub struct ClientBuilder {
     registry: HandlerRegistry,
+    writer_config: WriterConfig,
+    max_concurrent_handlers: usize,
 }
 
 impl ClientBuilder {
@@ -60,6 +67,8 @@ impl ClientBuilder {
     pub fn new() -> Self {
         Self {
             registry: HandlerRegistry::new(),
+            writer_config: WriterConfig::default(),
+            max_concurrent_handlers: DEFAULT_MAX_CONCURRENT_HANDLERS,
         }
     }
 
@@ -112,6 +121,41 @@ impl ClientBuilder {
         self
     }
 
+    /// Set the maximum number of concurrent handlers.
+    ///
+    /// When this limit is reached, new requests will be dropped with a warning.
+    /// Default: 256
+    pub fn max_concurrent_handlers(mut self, limit: usize) -> Self {
+        self.max_concurrent_handlers = limit;
+        self
+    }
+
+    /// Set the maximum pending frames for backpressure.
+    ///
+    /// When this limit is reached, response methods will wait until
+    /// backpressure clears or timeout.
+    /// Default: 1024
+    pub fn max_pending_frames(mut self, limit: usize) -> Self {
+        self.writer_config.max_pending_frames = limit;
+        self
+    }
+
+    /// Set the writer channel capacity.
+    ///
+    /// Default: 1024
+    pub fn channel_capacity(mut self, capacity: usize) -> Self {
+        self.writer_config.channel_capacity = capacity;
+        self
+    }
+
+    /// Set the backpressure timeout.
+    ///
+    /// Default: 5 seconds
+    pub fn backpressure_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.writer_config.backpressure_timeout = timeout;
+        self
+    }
+
     /// Build and start the client.
     ///
     /// This will:
@@ -121,7 +165,12 @@ impl ClientBuilder {
     /// 4. Accept parent connection
     /// 5. Start frame processing loop
     pub async fn start(self) -> Result<Client> {
-        Client::start(self.registry).await
+        Client::start(
+            self.registry,
+            self.writer_config,
+            self.max_concurrent_handlers,
+        )
+        .await
     }
 }
 
@@ -138,10 +187,12 @@ impl Default for ClientBuilder {
 pub struct Client {
     /// Registry of handlers.
     registry: Arc<HandlerRegistry>,
-    /// Shared pipe writer.
-    writer: SharedWriter,
+    /// Writer handle for sending frames.
+    writer: WriterHandle,
     /// Shutdown signal receiver.
     shutdown_rx: oneshot::Receiver<()>,
+    /// Writer task handle.
+    _writer_task: JoinHandle<Result<()>>,
 }
 
 impl Client {
@@ -150,8 +201,12 @@ impl Client {
         ClientBuilder::new()
     }
 
-    /// Start the client with the given registry.
-    async fn start(registry: HandlerRegistry) -> Result<Self> {
+    /// Start the client with the given registry and configuration.
+    async fn start(
+        registry: HandlerRegistry,
+        writer_config: WriterConfig,
+        max_concurrent_handlers: usize,
+    ) -> Result<Self> {
         // 1. Generate pipe path
         let pipe_path = generate_pipe_path();
 
@@ -171,17 +226,22 @@ impl Client {
         // 6. Split stream into reader and writer
         let (reader, write_half) = stream.into_split();
 
-        // 7. Create shared writer
-        let writer = shared_writer(write_half);
+        // 7. Spawn writer task (replaces Arc<Mutex<Writer>>)
+        let (writer, writer_task) = spawn_writer_task(write_half, writer_config);
 
-        // 8. Spawn read loop
+        // 8. Create handler semaphore
+        let handler_semaphore = Arc::new(Semaphore::new(max_concurrent_handlers));
+
+        // 9. Spawn read loop
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let registry = Arc::new(registry);
         let writer_clone = writer.clone();
         let registry_clone = registry.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = Self::read_loop(reader, registry_clone, writer_clone).await {
+            if let Err(e) =
+                Self::read_loop(reader, registry_clone, writer_clone, handler_semaphore).await
+            {
                 tracing::error!("Read loop error: {}", e);
             }
             let _ = shutdown_tx.send(());
@@ -191,6 +251,7 @@ impl Client {
             registry,
             writer,
             shutdown_rx,
+            _writer_task: writer_task,
         })
     }
 
@@ -198,7 +259,8 @@ impl Client {
     async fn read_loop<R: tokio::io::AsyncRead + Unpin>(
         mut reader: R,
         registry: Arc<HandlerRegistry>,
-        writer: SharedWriter,
+        writer: WriterHandle,
+        semaphore: Arc<Semaphore>,
     ) -> Result<()> {
         use tokio::io::AsyncReadExt;
 
@@ -217,7 +279,7 @@ impl Client {
 
             // Dispatch each frame
             for frame in frames {
-                Self::dispatch_frame(&frame, &registry, &writer).await;
+                Self::dispatch_frame(&frame, &registry, &writer, &semaphore).await;
             }
         }
     }
@@ -226,7 +288,8 @@ impl Client {
     async fn dispatch_frame(
         frame: &crate::protocol::Frame,
         registry: &Arc<HandlerRegistry>,
-        writer: &SharedWriter,
+        writer: &WriterHandle,
+        semaphore: &Arc<Semaphore>,
     ) {
         let header = &frame.header;
 
@@ -243,6 +306,19 @@ impl Client {
             return;
         }
 
+        // Try to acquire semaphore permit
+        let permit = match semaphore.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::warn!(
+                    "Handler capacity reached, dropping request {} for method {}",
+                    header.request_id,
+                    header.method_id
+                );
+                return;
+            }
+        };
+
         // Create context for handler
         let ctx = RequestContext::with_writer(header.method_id, header.request_id, writer.clone());
 
@@ -255,6 +331,9 @@ impl Client {
 
         // Spawn handler task
         tokio::spawn(async move {
+            // Permit is held until this task completes
+            let _permit = permit;
+
             match registry.dispatch(method_id, &payload, ctx).await {
                 Ok(()) => {}
                 Err(e) => {
@@ -282,13 +361,31 @@ impl Client {
             payload.len() as u32,
         );
 
-        let frame_bytes = build_frame(&header, &payload);
+        let frame = OutboundFrame::new(&header, Bytes::from(payload));
+        self.writer.send(frame).await
+    }
 
-        let mut guard = self.writer.lock().await;
-        guard.write_all(&frame_bytes).await?;
-        guard.flush().await?;
+    /// Emit an event with raw bytes payload.
+    pub async fn emit_raw(&self, event: &str, data: &[u8]) -> Result<()> {
+        let event_id = self
+            .registry
+            .get_event_id(event)
+            .ok_or_else(|| ProcwireError::Protocol(format!("Unknown event: {}", event)))?;
 
-        Ok(())
+        let header = Header::new(event_id, flags::DIRECTION_TO_PARENT, 0, data.len() as u32);
+
+        let frame = OutboundFrame::new(&header, Bytes::copy_from_slice(data));
+        self.writer.send(frame).await
+    }
+
+    /// Get the current backpressure status.
+    pub fn is_backpressure_active(&self) -> bool {
+        self.writer.is_backpressure_active()
+    }
+
+    /// Get the current pending frame count.
+    pub fn pending_frames(&self) -> usize {
+        self.writer.pending_count()
     }
 
     /// Wait for shutdown (pipe close or parent kill).
@@ -351,6 +448,23 @@ mod tests {
         assert_eq!(
             builder.registry.get_response_type("ack"),
             Some(ResponseType::Ack)
+        );
+    }
+
+    #[test]
+    fn test_builder_configuration() {
+        let builder = Client::builder()
+            .max_concurrent_handlers(512)
+            .max_pending_frames(2048)
+            .channel_capacity(512)
+            .backpressure_timeout(std::time::Duration::from_secs(10));
+
+        assert_eq!(builder.max_concurrent_handlers, 512);
+        assert_eq!(builder.writer_config.max_pending_frames, 2048);
+        assert_eq!(builder.writer_config.channel_capacity, 512);
+        assert_eq!(
+            builder.writer_config.backpressure_timeout,
+            std::time::Duration::from_secs(10)
         );
     }
 }
