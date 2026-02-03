@@ -286,7 +286,11 @@ where
     }
 }
 
-/// Write a batch of frames using scatter/gather I/O when possible.
+/// Write a batch of frames using scatter/gather I/O (write_vectored).
+///
+/// Always uses write_vectored for both single and multiple frames to minimize
+/// syscalls. For a single frame with payload, this reduces from 2-3 syscalls
+/// (header write, payload write, flush) to 1-2 syscalls (vectored write, flush).
 async fn write_batch<W>(writer: &mut W, batch: &[OutboundFrame]) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -295,19 +299,8 @@ where
         return Ok(());
     }
 
-    // For single frame, use simple write_all
-    if batch.len() == 1 {
-        let frame = &batch[0];
-        writer.write_all(&frame.header).await?;
-        if !frame.payload.is_empty() {
-            writer.write_all(&frame.payload).await?;
-        }
-        writer.flush().await?;
-        return Ok(());
-    }
-
-    // For multiple frames, use write_vectored if beneficial
     // Build IoSlice array: each frame contributes 1-2 slices (header, optionally payload)
+    // Using write_vectored even for single frame to minimize syscalls
     let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(batch.len() * 2);
 
     for frame in batch {
@@ -317,19 +310,37 @@ where
         }
     }
 
-    // Write all slices
-    // Note: write_vectored may not write all data in one call, so we need a loop
-    let mut total_written = 0;
+    // Calculate total size
     let total_size: usize = batch.iter().map(|f| f.size()).sum();
+
+    // Fast path: try single write_vectored call first
+    // This is the common case when kernel buffer has enough space
+    let written = writer.write_vectored(&slices).await?;
+
+    if written == total_size {
+        // All data written in one syscall - optimal case
+        writer.flush().await?;
+        return Ok(());
+    }
+
+    if written == 0 {
+        return Err(ProcwireError::Io(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "write_vectored returned 0",
+        )));
+    }
+
+    // Slow path: partial write, need to continue with remaining data
+    let mut total_written = written;
 
     while total_written < total_size {
         // Rebuild slices for remaining data
-        let slices = build_remaining_slices(batch, total_written);
-        if slices.is_empty() {
+        let remaining_slices = build_remaining_slices(batch, total_written);
+        if remaining_slices.is_empty() {
             break;
         }
 
-        let written = writer.write_vectored(&slices).await?;
+        let written = writer.write_vectored(&remaining_slices).await?;
         if written == 0 {
             return Err(ProcwireError::Io(std::io::Error::new(
                 std::io::ErrorKind::WriteZero,
