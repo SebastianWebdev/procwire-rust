@@ -7,6 +7,13 @@
 //! - `end` - end a stream (empty payload)
 //! - `error` - send an error response
 //!
+//! # Cancellation Support
+//!
+//! Handlers can check for and respond to ABORT signals from the parent:
+//! - `is_cancelled()` - check if request was aborted
+//! - `cancelled().await` - wait for cancellation (use with `tokio::select!`)
+//! - `cancellation_token()` - get token for child tasks
+//!
 //! # Example
 //!
 //! ```ignore
@@ -16,13 +23,30 @@
 //!
 //! async fn stream_handler(count: i32, ctx: RequestContext) -> Result<()> {
 //!     for i in 0..count {
+//!         // Check for cancellation
+//!         if ctx.is_cancelled() {
+//!             return Ok(());
+//!         }
 //!         ctx.chunk(&i).await?;
 //!     }
 //!     ctx.end().await
 //! }
+//!
+//! async fn long_task(data: Input, ctx: RequestContext) -> Result<()> {
+//!     tokio::select! {
+//!         _ = ctx.cancelled() => {
+//!             // Request was aborted, clean up
+//!             return Ok(());
+//!         }
+//!         result = do_work() => {
+//!             ctx.respond(&result).await
+//!         }
+//!     }
+//! }
 //! ```
 
 use bytes::Bytes;
+use tokio_util::sync::CancellationToken;
 
 use crate::codec::MsgPackCodec;
 use crate::error::Result;
@@ -39,6 +63,12 @@ use crate::writer::{OutboundFrame, WriterHandle};
 /// `RequestContext` is `Clone` and can be safely shared across async tasks.
 /// The underlying writer uses a channel-based architecture that eliminates
 /// lock contention.
+///
+/// # Cancellation
+///
+/// Each context has a [`CancellationToken`] that is triggered when the parent
+/// sends an ABORT signal. Handlers should check `is_cancelled()` periodically
+/// or use `cancelled().await` with `tokio::select!` for immediate response.
 #[derive(Clone)]
 pub struct RequestContext {
     /// Method ID for this request.
@@ -47,6 +77,8 @@ pub struct RequestContext {
     request_id: u32,
     /// Writer handle for sending responses.
     writer: Option<WriterHandle>,
+    /// Cancellation token for ABORT handling.
+    cancellation_token: CancellationToken,
 }
 
 impl RequestContext {
@@ -56,6 +88,7 @@ impl RequestContext {
             method_id,
             request_id,
             writer: None,
+            cancellation_token: CancellationToken::new(),
         }
     }
 
@@ -65,6 +98,24 @@ impl RequestContext {
             method_id,
             request_id,
             writer: Some(writer),
+            cancellation_token: CancellationToken::new(),
+        }
+    }
+
+    /// Create a new request context with a writer and cancellation token.
+    ///
+    /// Used internally when tracking active contexts for ABORT handling.
+    pub(crate) fn with_writer_and_token(
+        method_id: u16,
+        request_id: u32,
+        writer: WriterHandle,
+        cancellation_token: CancellationToken,
+    ) -> Self {
+        Self {
+            method_id,
+            request_id,
+            writer: Some(writer),
+            cancellation_token,
         }
     }
 
@@ -78,6 +129,75 @@ impl RequestContext {
     #[inline]
     pub fn request_id(&self) -> u32 {
         self.request_id
+    }
+
+    /// Check if this request has been cancelled.
+    ///
+    /// Handlers should check this periodically during long operations.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// for i in 0..1000 {
+    ///     if ctx.is_cancelled() {
+    ///         tracing::info!("Request cancelled at step {}", i);
+    ///         return Ok(());
+    ///     }
+    ///     do_step(i).await;
+    /// }
+    /// ```
+    #[inline]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation_token.is_cancelled()
+    }
+
+    /// Wait for cancellation.
+    ///
+    /// Use with `tokio::select!` to handle cancellation immediately:
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// tokio::select! {
+    ///     _ = ctx.cancelled() => {
+    ///         // Request was cancelled, clean up
+    ///         return Ok(());
+    ///     }
+    ///     result = do_work() => {
+    ///         ctx.respond(&result).await
+    ///     }
+    /// }
+    /// ```
+    pub fn cancelled(&self) -> tokio_util::sync::WaitForCancellationFuture<'_> {
+        self.cancellation_token.cancelled()
+    }
+
+    /// Get the cancellation token for advanced use cases.
+    ///
+    /// Useful when you need to pass the token to child tasks.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let token = ctx.cancellation_token();
+    /// let handle = tokio::spawn(async move {
+    ///     tokio::select! {
+    ///         _ = token.cancelled() => None,
+    ///         result = do_work() => Some(result),
+    ///     }
+    /// });
+    /// ```
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation_token.clone()
+    }
+
+    /// Cancel this request (internal use).
+    ///
+    /// Called when an ABORT frame is received for this request.
+    /// Currently used only in tests, but kept for potential future use.
+    #[allow(dead_code)]
+    pub(crate) fn cancel(&self) {
+        self.cancellation_token.cancel();
     }
 
     /// Send a response with the given payload.
@@ -286,5 +406,101 @@ mod tests {
         assert!(ctx.respond(&"hello").await.is_ok());
         assert!(ctx.chunk(&123i32).await.is_ok());
         assert!(ctx.end().await.is_ok());
+    }
+
+    #[test]
+    fn test_cancellation_token_initially_not_cancelled() {
+        let ctx = RequestContext::new(1, 42);
+        assert!(!ctx.is_cancelled());
+    }
+
+    #[test]
+    fn test_cancellation_after_cancel() {
+        let ctx = RequestContext::new(1, 42);
+        assert!(!ctx.is_cancelled());
+
+        ctx.cancel();
+
+        assert!(ctx.is_cancelled());
+    }
+
+    #[test]
+    fn test_cancellation_propagates_to_clones() {
+        let ctx = RequestContext::new(1, 42);
+        let ctx_clone = ctx.clone();
+
+        assert!(!ctx.is_cancelled());
+        assert!(!ctx_clone.is_cancelled());
+
+        ctx.cancel();
+
+        // Both should see cancellation
+        assert!(ctx.is_cancelled());
+        assert!(ctx_clone.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_future_completes_after_cancel() {
+        use std::time::Duration;
+
+        let ctx = RequestContext::new(1, 42);
+        let ctx_clone = ctx.clone();
+
+        // Spawn task that cancels after delay
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            ctx_clone.cancel();
+        });
+
+        // This should complete after cancellation
+        tokio::time::timeout(Duration::from_millis(100), ctx.cancelled())
+            .await
+            .expect("cancelled() should complete within timeout");
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_token_can_be_passed_to_child_task() {
+        use std::time::Duration;
+
+        let ctx = RequestContext::new(1, 42);
+        let token = ctx.cancellation_token();
+
+        // Spawn child task with token
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                _ = token.cancelled() => "cancelled",
+                _ = tokio::time::sleep(Duration::from_secs(10)) => "timeout",
+            }
+        });
+
+        // Cancel the context
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        ctx.cancel();
+
+        // Child should see cancellation
+        let result = tokio::time::timeout(Duration::from_millis(100), handle)
+            .await
+            .expect("task should complete")
+            .expect("task should not panic");
+
+        assert_eq!(result, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn test_with_writer_and_token() {
+        use crate::writer::spawn_writer_task_default;
+        use tokio::io::duplex;
+
+        let (client, _server) = duplex(4096);
+        let (writer_handle, _task) = spawn_writer_task_default(client);
+
+        let token = CancellationToken::new();
+        let ctx = RequestContext::with_writer_and_token(1, 42, writer_handle, token.clone());
+
+        assert!(!ctx.is_cancelled());
+
+        token.cancel();
+
+        assert!(ctx.is_cancelled());
     }
 }

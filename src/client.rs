@@ -33,13 +33,15 @@
 //! }
 //! ```
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
-use tokio::sync::{oneshot, Semaphore};
+use tokio::sync::{oneshot, RwLock, Semaphore};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::codec::MsgPackCodec;
 use crate::control::{build_init_message, write_stdout_line, ResponseType};
@@ -180,6 +182,12 @@ impl Default for ClientBuilder {
     }
 }
 
+/// Active request context holder for ABORT handling.
+struct ActiveContext {
+    /// Cancellation token to signal abort.
+    cancellation_token: CancellationToken,
+}
+
 /// A running Procwire client.
 ///
 /// Use `emit()` to send events to the parent.
@@ -193,6 +201,9 @@ pub struct Client {
     shutdown_rx: oneshot::Receiver<()>,
     /// Writer task handle.
     _writer_task: JoinHandle<Result<()>>,
+    /// Active request contexts for ABORT handling.
+    /// Maps request_id -> ActiveContext
+    _active_contexts: Arc<RwLock<HashMap<u32, ActiveContext>>>,
 }
 
 impl Client {
@@ -232,15 +243,25 @@ impl Client {
         // 8. Create handler semaphore
         let handler_semaphore = Arc::new(Semaphore::new(max_concurrent_handlers));
 
-        // 9. Spawn read loop
+        // 9. Create active contexts map for ABORT handling
+        let active_contexts = Arc::new(RwLock::new(HashMap::new()));
+
+        // 10. Spawn read loop
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let registry = Arc::new(registry);
         let writer_clone = writer.clone();
         let registry_clone = registry.clone();
+        let active_contexts_clone = active_contexts.clone();
 
         tokio::spawn(async move {
-            if let Err(e) =
-                Self::read_loop(reader, registry_clone, writer_clone, handler_semaphore).await
+            if let Err(e) = Self::read_loop(
+                reader,
+                registry_clone,
+                writer_clone,
+                handler_semaphore,
+                active_contexts_clone,
+            )
+            .await
             {
                 tracing::error!("Read loop error: {}", e);
             }
@@ -252,6 +273,7 @@ impl Client {
             writer,
             shutdown_rx,
             _writer_task: writer_task,
+            _active_contexts: active_contexts,
         })
     }
 
@@ -261,6 +283,7 @@ impl Client {
         registry: Arc<HandlerRegistry>,
         writer: WriterHandle,
         semaphore: Arc<Semaphore>,
+        active_contexts: Arc<RwLock<HashMap<u32, ActiveContext>>>,
     ) -> Result<()> {
         use tokio::io::AsyncReadExt;
 
@@ -279,7 +302,8 @@ impl Client {
 
             // Dispatch each frame
             for frame in frames {
-                Self::dispatch_frame(&frame, &registry, &writer, &semaphore).await;
+                Self::dispatch_frame(&frame, &registry, &writer, &semaphore, &active_contexts)
+                    .await;
             }
         }
     }
@@ -290,13 +314,25 @@ impl Client {
         registry: &Arc<HandlerRegistry>,
         writer: &WriterHandle,
         semaphore: &Arc<Semaphore>,
+        active_contexts: &Arc<RwLock<HashMap<u32, ActiveContext>>>,
     ) {
         let header = &frame.header;
 
         // Handle ABORT signal
         if header.method_id == ABORT_METHOD_ID {
             tracing::debug!("Received ABORT for request {}", header.request_id);
-            // TODO: Implement cancellation
+
+            // Find and cancel the active context
+            let contexts = active_contexts.read().await;
+            if let Some(ctx) = contexts.get(&header.request_id) {
+                ctx.cancellation_token.cancel();
+                tracing::debug!("Cancelled request {}", header.request_id);
+            } else {
+                tracing::warn!(
+                    "ABORT for unknown or completed request {}",
+                    header.request_id
+                );
+            }
             return;
         }
 
@@ -319,8 +355,27 @@ impl Client {
             }
         };
 
-        // Create context for handler
-        let ctx = RequestContext::with_writer(header.method_id, header.request_id, writer.clone());
+        // Create cancellation token for this request
+        let cancellation_token = CancellationToken::new();
+
+        // Register active context for abort handling
+        {
+            let mut contexts = active_contexts.write().await;
+            contexts.insert(
+                header.request_id,
+                ActiveContext {
+                    cancellation_token: cancellation_token.clone(),
+                },
+            );
+        }
+
+        // Create context for handler with the cancellation token
+        let ctx = RequestContext::with_writer_and_token(
+            header.method_id,
+            header.request_id,
+            writer.clone(),
+            cancellation_token,
+        );
 
         // Get payload
         let payload = frame.payload.clone();
@@ -328,6 +383,8 @@ impl Client {
         // Clone what we need for the spawned task
         let registry = registry.clone();
         let method_id = header.method_id;
+        let request_id = header.request_id;
+        let active_contexts = active_contexts.clone();
 
         // Spawn handler task
         tokio::spawn(async move {
@@ -340,6 +397,10 @@ impl Client {
                     tracing::error!("Handler error for method {}: {}", method_id, e);
                 }
             }
+
+            // Remove from active contexts when handler completes
+            let mut contexts = active_contexts.write().await;
+            contexts.remove(&request_id);
         });
     }
 
@@ -466,5 +527,174 @@ mod tests {
             builder.writer_config.backpressure_timeout,
             std::time::Duration::from_secs(10)
         );
+    }
+
+    #[tokio::test]
+    async fn test_abort_cancels_active_handler() {
+        use crate::protocol::{Frame, Header, ABORT_METHOD_ID};
+
+        // Setup: Create active_contexts map and add a context
+        let active_contexts = Arc::new(RwLock::new(HashMap::new()));
+        let cancellation_token = CancellationToken::new();
+
+        {
+            let mut contexts = active_contexts.write().await;
+            contexts.insert(
+                42, // request_id
+                ActiveContext {
+                    cancellation_token: cancellation_token.clone(),
+                },
+            );
+        }
+
+        // Verify not cancelled initially
+        assert!(!cancellation_token.is_cancelled());
+
+        // Create ABORT frame
+        let abort_header = Header::new(ABORT_METHOD_ID, 0, 42, 0);
+        let abort_frame = Frame::new(abort_header, bytes::Bytes::new());
+
+        // Create minimal mocks for dispatch_frame
+        let registry = Arc::new(HandlerRegistry::new());
+        let (client, _server) = tokio::io::duplex(4096);
+        let (writer, _task) =
+            crate::writer::spawn_writer_task(client, crate::writer::WriterConfig::default());
+        let semaphore = Arc::new(Semaphore::new(256));
+
+        // Dispatch ABORT frame
+        Client::dispatch_frame(
+            &abort_frame,
+            &registry,
+            &writer,
+            &semaphore,
+            &active_contexts,
+        )
+        .await;
+
+        // Verify cancellation was triggered
+        assert!(cancellation_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_abort_for_unknown_request_logs_warning() {
+        use crate::protocol::{Frame, Header, ABORT_METHOD_ID};
+
+        // Setup: Create empty active_contexts map
+        let active_contexts = Arc::new(RwLock::new(HashMap::new()));
+
+        // Create ABORT frame for non-existent request
+        let abort_header = Header::new(ABORT_METHOD_ID, 0, 999, 0);
+        let abort_frame = Frame::new(abort_header, bytes::Bytes::new());
+
+        // Create minimal mocks
+        let registry = Arc::new(HandlerRegistry::new());
+        let (client, _server) = tokio::io::duplex(4096);
+        let (writer, _task) =
+            crate::writer::spawn_writer_task(client, crate::writer::WriterConfig::default());
+        let semaphore = Arc::new(Semaphore::new(256));
+
+        // Dispatch ABORT frame - should not panic, just log warning
+        Client::dispatch_frame(
+            &abort_frame,
+            &registry,
+            &writer,
+            &semaphore,
+            &active_contexts,
+        )
+        .await;
+
+        // No assertion needed - we just verify it doesn't panic
+    }
+
+    #[tokio::test]
+    async fn test_handler_context_is_removed_after_completion() {
+        use crate::protocol::{Frame, Header};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        // Setup
+        let active_contexts = Arc::new(RwLock::new(HashMap::new()));
+        let handler_started = Arc::new(AtomicBool::new(false));
+        let handler_completed = Arc::new(AtomicBool::new(false));
+
+        let handler_started_clone = handler_started.clone();
+        let handler_completed_clone = handler_completed.clone();
+
+        // Create registry with a handler that signals when it runs
+        let mut registry = HandlerRegistry::new();
+        registry.register(
+            "test",
+            crate::control::ResponseType::Result,
+            move |_: (), ctx: RequestContext| {
+                let started = handler_started_clone.clone();
+                let completed = handler_completed_clone.clone();
+                async move {
+                    started.store(true, Ordering::SeqCst);
+                    // Small delay to allow test to check active_contexts
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    ctx.respond(&"done").await?;
+                    completed.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+        );
+
+        let registry = Arc::new(registry);
+
+        // Create test writer
+        let (client, _server) = tokio::io::duplex(4096);
+        let (writer, _task) =
+            crate::writer::spawn_writer_task(client, crate::writer::WriterConfig::default());
+        let semaphore = Arc::new(Semaphore::new(256));
+
+        // Get the method ID assigned to "test"
+        let method_id = registry.get_method_id("test").unwrap();
+
+        // Create request frame with empty MsgPack payload for ()
+        let payload = crate::codec::MsgPackCodec::encode(&()).unwrap();
+        let header = Header::new(method_id, 0, 123, payload.len() as u32);
+        let frame = Frame::new(header, bytes::Bytes::from(payload));
+
+        // Dispatch frame
+        Client::dispatch_frame(&frame, &registry, &writer, &semaphore, &active_contexts).await;
+
+        // Wait for handler to start
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while !handler_started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Handler should start");
+
+        // Context should be in active_contexts
+        {
+            let contexts = active_contexts.read().await;
+            assert!(
+                contexts.contains_key(&123),
+                "Context should be active while handler runs"
+            );
+        }
+
+        // Wait for handler to complete
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while !handler_completed.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Handler should complete");
+
+        // Give a bit of time for cleanup
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Context should be removed from active_contexts
+        {
+            let contexts = active_contexts.read().await;
+            assert!(
+                !contexts.contains_key(&123),
+                "Context should be removed after handler completes"
+            );
+        }
     }
 }
