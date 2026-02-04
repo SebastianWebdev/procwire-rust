@@ -13,7 +13,7 @@
 //! let stream = listener.accept().await?;
 //! ```
 
-use crate::error::{ProcwireError, Result};
+use crate::error::Result;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Generate a unique pipe path for this process.
