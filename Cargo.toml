@@ -1,6 +1,6 @@
 [package]
 name = "procwire-client"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "Rust client SDK for Procwire IPC — high-performance binary protocol for Node.js ↔ Rust communication"
 license = "MIT"
