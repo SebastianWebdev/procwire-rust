@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Control-plane heartbeat**: child now reads newline-delimited JSON-RPC on
+  stdin and replies to `$ping` with `$pong`, keeping it alive under
+  heartbeat-enabled parents (`spawnPolicy({ heartbeat })`).
+- **Graceful `$shutdown`**: child reacts to a `$shutdown` control message and
+  exits promptly via `wait_for_shutdown()` instead of waiting for the parent's
+  force-kill grace period. New `Client::is_shutdown_requested()`.
+- **Configurable incoming frame limit**: `ClientBuilder::max_payload_size()`
+  bounds the declared `payloadLength` of incoming frames (clamped to
+  `ABSOLUTE_MAX_PAYLOAD_SIZE`); oversized frames tear down the connection with
+  no giant allocation.
+- **Structured error responses**: `RequestContext::error_with()` sends an
+  arbitrary `Serialize` error payload (e.g. `{ "message", "code" }`).
+
+### Notes
+
+- The control-plane reader runs on a dedicated OS thread so a blocking stdin
+  read never keeps the async runtime or process alive.
+
 ## [1.0.0] - 2026-02-03
 
 ### Added

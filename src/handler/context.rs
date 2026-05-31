@@ -253,11 +253,25 @@ impl RequestContext {
         self.send_frame_empty(flags::STREAM_END_RESPONSE).await
     }
 
-    /// Send an error response.
+    /// Send an error response with a plain string message.
     ///
-    /// Serializes the error message and sends an error frame.
+    /// Serializes the error message and sends an error frame. The parent
+    /// surfaces the string as the rejection reason.
     pub async fn error(&self, message: &str) -> Result<()> {
         let data = MsgPackCodec::encode(&message)?;
+        self.send_frame(flags::ERROR_RESPONSE, Bytes::from(data))
+            .await
+    }
+
+    /// Send a structured error response.
+    ///
+    /// Serializes any [`serde::Serialize`] value as the error payload. The
+    /// parent derives its message from a string `message` field if present and
+    /// preserves the whole object on `error.data`, so prefer an object shaped
+    /// like `{ "message": "...", "code": ... }`. A plain string ([`Self::error`])
+    /// also remains valid.
+    pub async fn error_with<T: serde::Serialize>(&self, error: &T) -> Result<()> {
+        let data = MsgPackCodec::encode(error)?;
         self.send_frame(flags::ERROR_RESPONSE, Bytes::from(data))
             .await
     }
@@ -352,6 +366,22 @@ mod tests {
         assert!(ctx.chunk_bytes(Bytes::from_static(b"chunk")).await.is_ok());
         assert!(ctx.end().await.is_ok());
         assert!(ctx.error("error message").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_error_with_structured_payload() {
+        #[derive(serde::Serialize)]
+        struct StructuredError {
+            message: String,
+            code: i32,
+        }
+
+        let ctx = RequestContext::new(1, 42);
+        let err = StructuredError {
+            message: "boom".to_string(),
+            code: 500,
+        };
+        assert!(ctx.error_with(&err).await.is_ok());
     }
 
     #[tokio::test]

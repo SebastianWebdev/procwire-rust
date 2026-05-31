@@ -44,10 +44,13 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::codec::MsgPackCodec;
-use crate::control::{build_init_message, write_stdout_line, ResponseType};
+use crate::control::{build_init_message, run_control_reader, write_stdout_line, ResponseType};
 use crate::error::{ProcwireError, Result};
 use crate::handler::{HandlerRegistry, HandlerResult, RequestContext};
-use crate::protocol::{flags, FrameBuffer, Header, ABORT_METHOD_ID};
+use crate::protocol::{
+    flags, FrameBuffer, Header, ABORT_METHOD_ID, ABSOLUTE_MAX_PAYLOAD_SIZE,
+    DEFAULT_MAX_PAYLOAD_SIZE,
+};
 use crate::transport::{generate_pipe_path, PipeListener};
 use crate::writer::{spawn_writer_task, OutboundFrame, WriterConfig, WriterHandle};
 
@@ -62,6 +65,7 @@ pub struct ClientBuilder {
     registry: HandlerRegistry,
     writer_config: WriterConfig,
     max_concurrent_handlers: usize,
+    max_payload_size: u32,
 }
 
 impl ClientBuilder {
@@ -71,6 +75,7 @@ impl ClientBuilder {
             registry: HandlerRegistry::new(),
             writer_config: WriterConfig::default(),
             max_concurrent_handlers: DEFAULT_MAX_CONCURRENT_HANDLERS,
+            max_payload_size: DEFAULT_MAX_PAYLOAD_SIZE,
         }
     }
 
@@ -158,6 +163,22 @@ impl ClientBuilder {
         self
     }
 
+    /// Set the maximum size (in bytes) of an incoming frame's payload.
+    ///
+    /// The declared `payloadLength` of every incoming frame is checked against
+    /// this limit **before** any payload buffer is allocated. A frame that
+    /// exceeds the limit is rejected and the connection is torn down, instead of
+    /// attempting a huge allocation (a DoS/OOM vector, since `payloadLength` is
+    /// peer-controlled).
+    ///
+    /// Values are clamped to [`ABSOLUTE_MAX_PAYLOAD_SIZE`] (~2 GiB − 1).
+    ///
+    /// Default: [`DEFAULT_MAX_PAYLOAD_SIZE`] (1 GiB)
+    pub fn max_payload_size(mut self, size: u32) -> Self {
+        self.max_payload_size = size.min(ABSOLUTE_MAX_PAYLOAD_SIZE);
+        self
+    }
+
     /// Build and start the client.
     ///
     /// This will:
@@ -171,6 +192,7 @@ impl ClientBuilder {
             self.registry,
             self.writer_config,
             self.max_concurrent_handlers,
+            self.max_payload_size,
         )
         .await
     }
@@ -197,8 +219,10 @@ pub struct Client {
     registry: Arc<HandlerRegistry>,
     /// Writer handle for sending frames.
     writer: WriterHandle,
-    /// Shutdown signal receiver.
+    /// Shutdown signal receiver (fires when the data plane closes).
     shutdown_rx: oneshot::Receiver<()>,
+    /// Control-plane shutdown token (fires when `$shutdown` is received).
+    shutdown_token: CancellationToken,
     /// Writer task handle.
     _writer_task: JoinHandle<Result<()>>,
     /// Active request contexts for ABORT handling.
@@ -217,11 +241,14 @@ impl Client {
         registry: HandlerRegistry,
         writer_config: WriterConfig,
         max_concurrent_handlers: usize,
+        max_payload_size: u32,
     ) -> Result<Self> {
         // 1. Generate pipe path
         let pipe_path = generate_pipe_path();
 
-        // 2. Start pipe listener
+        // 2. Start pipe listener (MUST be listening before $init is announced,
+        //    so the parent's connect — which is now bounded by a timeout — finds
+        //    the server ready).
         let listener = PipeListener::bind(&pipe_path).await?;
 
         // 3. Build schema from registry
@@ -231,22 +258,32 @@ impl Client {
         let init_msg = build_init_message(&pipe_path, &schema);
         write_stdout_line(&init_msg)?;
 
-        // 5. Accept parent connection
+        // 5. Spawn the control-plane reader (heartbeat + graceful shutdown).
+        //    It runs on a dedicated OS thread so a blocking stdin read can never
+        //    keep the runtime/process alive; it simply dies with the process.
+        let shutdown_token = CancellationToken::new();
+        let control_token = shutdown_token.clone();
+        std::thread::Builder::new()
+            .name("procwire-control".to_string())
+            .spawn(move || run_control_reader(control_token))
+            .map_err(ProcwireError::Io)?;
+
+        // 6. Accept the single parent connection.
         let stream = listener.accept().await?;
 
-        // 6. Split stream into reader and writer
+        // 7. Split stream into reader and writer
         let (reader, write_half) = stream.into_split();
 
-        // 7. Spawn writer task (replaces Arc<Mutex<Writer>>)
+        // 8. Spawn writer task (replaces Arc<Mutex<Writer>>)
         let (writer, writer_task) = spawn_writer_task(write_half, writer_config);
 
-        // 8. Create handler semaphore
+        // 9. Create handler semaphore
         let handler_semaphore = Arc::new(Semaphore::new(max_concurrent_handlers));
 
-        // 9. Create active contexts map for ABORT handling
+        // 10. Create active contexts map for ABORT handling
         let active_contexts = Arc::new(RwLock::new(HashMap::new()));
 
-        // 10. Spawn read loop
+        // 11. Spawn read loop
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let registry = Arc::new(registry);
         let writer_clone = writer.clone();
@@ -260,6 +297,7 @@ impl Client {
                 writer_clone,
                 handler_semaphore,
                 active_contexts_clone,
+                max_payload_size,
             )
             .await
             {
@@ -272,6 +310,7 @@ impl Client {
             registry,
             writer,
             shutdown_rx,
+            shutdown_token,
             _writer_task: writer_task,
             _active_contexts: active_contexts,
         })
@@ -284,10 +323,14 @@ impl Client {
         writer: WriterHandle,
         semaphore: Arc<Semaphore>,
         active_contexts: Arc<RwLock<HashMap<u32, ActiveContext>>>,
+        max_payload_size: u32,
     ) -> Result<()> {
         use tokio::io::AsyncReadExt;
 
-        let mut frame_buffer = FrameBuffer::new();
+        // Bound incoming frame sizes: an oversized/invalid `payloadLength` makes
+        // `push` return an error here, which ends the loop and tears down the
+        // connection without ever allocating the giant buffer.
+        let mut frame_buffer = FrameBuffer::with_max_payload(max_payload_size);
         let mut buf = vec![0u8; 64 * 1024]; // 64KB read buffer
 
         loop {
@@ -449,12 +492,34 @@ impl Client {
         self.writer.pending_count()
     }
 
-    /// Wait for shutdown (pipe close or parent kill).
+    /// Wait for shutdown.
     ///
-    /// This consumes the client and blocks until the connection closes.
+    /// This consumes the client and resolves when **either**:
+    /// - the data plane closes (pipe EOF / parent kill / read error), or
+    /// - a `$shutdown` message is received on the control plane.
+    ///
+    /// Returning lets `main` exit promptly, which drops the connection and ends
+    /// the process — graceful teardown rather than waiting for the parent's
+    /// force-kill grace period.
     pub async fn wait_for_shutdown(self) -> Result<()> {
-        let _ = self.shutdown_rx.await;
+        let shutdown_rx = self.shutdown_rx;
+        let shutdown_token = self.shutdown_token;
+
+        tokio::select! {
+            _ = shutdown_rx => {
+                tracing::debug!("Data plane closed; shutting down");
+            }
+            _ = shutdown_token.cancelled() => {
+                tracing::info!("$shutdown received; shutting down gracefully");
+            }
+        }
+
         Ok(())
+    }
+
+    /// Returns `true` once a `$shutdown` has been requested on the control plane.
+    pub fn is_shutdown_requested(&self) -> bool {
+        self.shutdown_token.is_cancelled()
     }
 }
 
@@ -527,6 +592,25 @@ mod tests {
             builder.writer_config.backpressure_timeout,
             std::time::Duration::from_secs(10)
         );
+    }
+
+    #[test]
+    fn test_builder_max_payload_size_default() {
+        let builder = Client::builder();
+        assert_eq!(builder.max_payload_size, DEFAULT_MAX_PAYLOAD_SIZE);
+    }
+
+    #[test]
+    fn test_builder_max_payload_size_custom() {
+        let builder = Client::builder().max_payload_size(4096);
+        assert_eq!(builder.max_payload_size, 4096);
+    }
+
+    #[test]
+    fn test_builder_max_payload_size_clamped_to_absolute_max() {
+        // u32::MAX (~4 GiB) must be clamped to the absolute ceiling (~2 GiB - 1).
+        let builder = Client::builder().max_payload_size(u32::MAX);
+        assert_eq!(builder.max_payload_size, ABSOLUTE_MAX_PAYLOAD_SIZE);
     }
 
     #[tokio::test]
