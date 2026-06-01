@@ -36,18 +36,31 @@ pub fn generate_pipe_path() -> String {
     }
 }
 
-/// Simple random u64 using system time and process ID.
+/// Generate a pseudo-random `u64` that is unique per call within a process.
+///
+/// Mixes the wall clock and PID (for cross-process uniqueness) with a
+/// process-wide monotonic counter. The counter is the key part: it guarantees
+/// distinct output on every call even when the system clock has coarse
+/// resolution (macOS microseconds, Windows ~100ns–15ms), where two calls in a
+/// tight loop would otherwise observe the same timestamp and collide.
 fn rand_u64() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
 
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
 
-    // Mix in process ID and some bit shuffling for better randomness
+    // Mix in process ID and the monotonic sequence so every value is unique.
     let pid = std::process::id() as u64;
-    nanos.wrapping_mul(0x517cc1b727220a95) ^ pid
+    nanos
+        .wrapping_mul(0x517cc1b727220a95)
+        .wrapping_add(seq.wrapping_mul(0x9E3779B97F4A7C15))
+        ^ pid
 }
 
 // ============================================================================
@@ -216,8 +229,7 @@ mod windows_impl {
             // Verify we can create the pipe (will be created on first accept)
             let _ = ServerOptions::new()
                 .first_pipe_instance(true)
-                .create(path)
-                .map_err(ProcwireError::Io)?;
+                .create(path)?;
 
             Ok(Self {
                 path: path.to_string(),
@@ -228,8 +240,7 @@ mod windows_impl {
         pub async fn accept(&self) -> Result<PipeStream> {
             let server = ServerOptions::new()
                 .first_pipe_instance(false)
-                .create(&self.path)
-                .map_err(ProcwireError::Io)?;
+                .create(&self.path)?;
 
             server.connect().await?;
 

@@ -34,7 +34,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        rust: [stable, "1.75"]
+        rust: [stable, "1.85"]
 
     runs-on: ${{ matrix.os }}
 
@@ -81,6 +81,13 @@ jobs:
   # Security audit
   security:
     runs-on: ubuntu-latest
+    # rustsec/audit-check publishes its findings as a check run, which requires
+    # `checks: write`. Without it the action fails with
+    # "Resource not accessible by integration" when the default GITHUB_TOKEN is
+    # read-only.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2
