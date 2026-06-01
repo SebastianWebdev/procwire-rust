@@ -229,8 +229,7 @@ mod windows_impl {
             // Verify we can create the pipe (will be created on first accept)
             let _ = ServerOptions::new()
                 .first_pipe_instance(true)
-                .create(path)
-                .map_err(ProcwireError::Io)?;
+                .create(path)?;
 
             Ok(Self {
                 path: path.to_string(),
@@ -241,8 +240,7 @@ mod windows_impl {
         pub async fn accept(&self) -> Result<PipeStream> {
             let server = ServerOptions::new()
                 .first_pipe_instance(false)
-                .create(&self.path)
-                .map_err(ProcwireError::Io)?;
+                .create(&self.path)?;
 
             server.connect().await?;
 
