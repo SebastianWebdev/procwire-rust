@@ -25,7 +25,7 @@ use bytes::{Bytes, BytesMut};
 
 use super::wire_format::{Header, DEFAULT_MAX_PAYLOAD_SIZE, HEADER_SIZE};
 use super::Frame;
-use crate::error::{ProcwireError, Result};
+use crate::error::Result;
 
 /// State machine for frame parsing.
 #[derive(Debug, Clone)]
@@ -127,13 +127,12 @@ impl FrameBuffer {
                 let header =
                     Header::decode(&self.buffer[..HEADER_SIZE]).expect("Buffer has enough bytes");
 
-                // Validate payload size
-                if header.payload_length > self.max_payload_size {
-                    return Err(ProcwireError::Protocol(format!(
-                        "Payload size {} exceeds maximum {}",
-                        header.payload_length, self.max_payload_size
-                    )));
-                }
+                // Enforce the full wire contract on every parsed frame (D6),
+                // mirroring the TypeScript `FrameBuffer`: reject reserved
+                // method id 0, reserved flag bits, and an oversized
+                // `payloadLength` *before* allocating the payload buffer. An
+                // error here ends the read loop and tears down the connection.
+                header.validate(self.max_payload_size)?;
 
                 // Consume header bytes
                 let _ = self.buffer.split_to(HEADER_SIZE);
@@ -341,6 +340,50 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn test_receive_rejects_method_id_zero() {
+        // D6: a frame with reserved method id 0 is dropped on receive.
+        let mut buffer = FrameBuffer::new();
+        let header = Header::new(0, 0, 42, 0);
+        let result = buffer.push(&header.encode());
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Method ID 0"));
+    }
+
+    #[test]
+    fn test_receive_rejects_reserved_flag_bits() {
+        // D6: reserved flag bits (6-7) must be zero on receive.
+        let mut buffer = FrameBuffer::new();
+        let header = Header::new(1, 0b1000_0000, 42, 0);
+        let result = buffer.push(&header.encode());
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Reserved flag bits"));
+    }
+
+    #[test]
+    fn test_receive_allows_abort_and_auth_method_ids() {
+        use crate::protocol::{ABORT_METHOD_ID, AUTH_METHOD_ID};
+
+        // The reserved abort/auth method ids must pass framing validation.
+        let mut buffer = FrameBuffer::new();
+        let abort = make_frame_bytes(ABORT_METHOD_ID, 0, 7, b"");
+        let auth = make_frame_bytes(AUTH_METHOD_ID, 0, 0, b"token-bytes");
+
+        let mut combined = abort;
+        combined.extend_from_slice(&auth);
+
+        let frames = buffer.push(&combined).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].method_id(), ABORT_METHOD_ID);
+        assert_eq!(frames[1].method_id(), AUTH_METHOD_ID);
+        assert_eq!(&frames[1].payload[..], b"token-bytes");
     }
 
     #[test]

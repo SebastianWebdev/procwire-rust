@@ -3,7 +3,9 @@
 //! These tests verify the integration between different modules.
 
 use procwire_client::codec::MsgPackCodec;
-use procwire_client::protocol::{build_frame, flags, FrameBuffer, Header, HEADER_SIZE};
+use procwire_client::protocol::{
+    build_frame, flags, FrameBuffer, Header, AUTH_METHOD_ID, HEADER_SIZE,
+};
 
 /// Test full frame encode/decode cycle with MsgPack payload.
 #[test]
@@ -109,10 +111,10 @@ fn test_stream_pattern() {
     assert_eq!(frames.len(), 4);
 
     // Verify chunks
-    for i in 0..3 {
-        assert!(frames[i].is_stream());
-        assert!(!frames[i].is_stream_end());
-        let value: i32 = MsgPackCodec::decode(&frames[i].payload).unwrap();
+    for (i, frame) in frames.iter().take(3).enumerate() {
+        assert!(frame.is_stream());
+        assert!(!frame.is_stream_end());
+        let value: i32 = MsgPackCodec::decode(&frame.payload).unwrap();
         assert_eq!(value, (i + 1) as i32);
     }
 
@@ -183,6 +185,34 @@ fn test_event_to_parent() {
 
     let decoded: String = MsgPackCodec::decode(&frame.payload).unwrap();
     assert_eq!(decoded, "progress update");
+}
+
+/// Test the data-plane AUTH frame wire format.
+///
+/// Mirrors the parent's `_sendAuth`: methodId `0xFFFE`, flags `0`, requestId
+/// `0`, payload = the raw token bytes (no codec framing). The child must be able
+/// to parse this as the first frame of an auth-enabled connection.
+#[test]
+fn test_auth_frame_wire_format() {
+    // The parent's token is a 64-char lowercase-hex string (32 random bytes).
+    let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let token_bytes = token.as_bytes();
+
+    let header = Header::new(AUTH_METHOD_ID, 0, 0, token_bytes.len() as u32);
+    let frame_bytes = build_frame(&header, token_bytes);
+
+    let mut buffer = FrameBuffer::new();
+    let frames = buffer.push(&frame_bytes).unwrap();
+
+    assert_eq!(frames.len(), 1);
+    let frame = &frames[0];
+
+    assert_eq!(frame.header.method_id, AUTH_METHOD_ID);
+    assert_eq!(frame.header.flags, 0);
+    assert_eq!(frame.header.request_id, 0);
+    assert!(!frame.is_response());
+    // The payload is the raw token bytes — NOT codec-encoded.
+    assert_eq!(&frame.payload[..], token_bytes);
 }
 
 /// Test fragmented frame parsing.

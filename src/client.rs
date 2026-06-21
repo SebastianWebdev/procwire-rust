@@ -48,7 +48,7 @@ use crate::control::{build_init_message, run_control_reader, write_stdout_line, 
 use crate::error::{ProcwireError, Result};
 use crate::handler::{HandlerRegistry, HandlerResult, RequestContext};
 use crate::protocol::{
-    flags, FrameBuffer, Header, ABORT_METHOD_ID, ABSOLUTE_MAX_PAYLOAD_SIZE,
+    flags, Frame, FrameBuffer, Header, ABORT_METHOD_ID, ABSOLUTE_MAX_PAYLOAD_SIZE, AUTH_METHOD_ID,
     DEFAULT_MAX_PAYLOAD_SIZE,
 };
 use crate::transport::{generate_pipe_path, PipeListener};
@@ -66,6 +66,7 @@ pub struct ClientBuilder {
     writer_config: WriterConfig,
     max_concurrent_handlers: usize,
     max_payload_size: u32,
+    auth_token: Option<String>,
 }
 
 impl ClientBuilder {
@@ -76,6 +77,7 @@ impl ClientBuilder {
             writer_config: WriterConfig::default(),
             max_concurrent_handlers: DEFAULT_MAX_CONCURRENT_HANDLERS,
             max_payload_size: DEFAULT_MAX_PAYLOAD_SIZE,
+            auth_token: None,
         }
     }
 
@@ -179,20 +181,45 @@ impl ClientBuilder {
         self
     }
 
+    /// Set the data-plane authentication token explicitly.
+    ///
+    /// When a token is configured, the client holds every accepted connection
+    /// **pending** until its first data-plane frame is an [`AUTH_METHOD_ID`]
+    /// frame whose payload equals this token (compared in constant time); only
+    /// then is the connection adopted. A missing/mismatched first frame drops
+    /// the connection while the listener keeps waiting for the real parent.
+    ///
+    /// If this is not set, the token defaults to the `PROCWIRE_TOKEN`
+    /// environment variable (which an `auth: true` parent sets on the child).
+    /// When neither is present, authentication is disabled and connections are
+    /// adopted on accept — fully compatible with non-auth parents.
+    pub fn auth_token(mut self, token: impl Into<String>) -> Self {
+        self.auth_token = Some(token.into());
+        self
+    }
+
     /// Build and start the client.
     ///
     /// This will:
     /// 1. Generate pipe path
     /// 2. Start pipe listener
     /// 3. Send `$init` to parent (stdout)
-    /// 4. Accept parent connection
+    /// 4. Accept (and, when a token is configured, authenticate) the parent connection
     /// 5. Start frame processing loop
     pub async fn start(self) -> Result<Client> {
+        // An explicit builder token wins; otherwise fall back to PROCWIRE_TOKEN
+        // (set by an auth-enabled parent). An empty value disables auth.
+        let auth_token = self
+            .auth_token
+            .or_else(|| std::env::var("PROCWIRE_TOKEN").ok())
+            .filter(|t| !t.is_empty());
+
         Client::start(
             self.registry,
             self.writer_config,
             self.max_concurrent_handlers,
             self.max_payload_size,
+            auth_token,
         )
         .await
     }
@@ -208,6 +235,36 @@ impl Default for ClientBuilder {
 struct ActiveContext {
     /// Cancellation token to signal abort.
     cancellation_token: CancellationToken,
+}
+
+/// Outcome of the data-plane authentication handshake for one connection.
+enum AuthOutcome {
+    /// The connection authenticated. `frame_buffer` carries any bytes buffered
+    /// past the AUTH frame; `pending_frames` are whole frames already parsed
+    /// after it (pipelined in the same packet) that must be dispatched.
+    Adopted {
+        frame_buffer: FrameBuffer,
+        pending_frames: Vec<Frame>,
+    },
+    /// The connection failed authentication and must be dropped.
+    Rejected,
+}
+
+/// Constant-time byte-slice equality.
+///
+/// Returns `false` immediately on a length mismatch (the length is not secret),
+/// otherwise compares every byte without short-circuiting so the comparison
+/// time does not leak how many leading bytes matched. This mirrors the Node
+/// client's use of `crypto.timingSafeEqual` for the AUTH token check.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// A running Procwire client.
@@ -237,11 +294,15 @@ impl Client {
     }
 
     /// Start the client with the given registry and configuration.
+    ///
+    /// When `auth_token` is `Some`, the data-plane connection must authenticate
+    /// with a matching AUTH frame as its first frame before it is adopted.
     async fn start(
         registry: HandlerRegistry,
         writer_config: WriterConfig,
         max_concurrent_handlers: usize,
         max_payload_size: u32,
+        auth_token: Option<String>,
     ) -> Result<Self> {
         // 1. Generate pipe path
         let pipe_path = generate_pipe_path();
@@ -268,22 +329,55 @@ impl Client {
             .spawn(move || run_control_reader(control_token))
             .map_err(ProcwireError::Io)?;
 
-        // 6. Accept the single parent connection.
-        let stream = listener.accept().await?;
+        // 6. Accept (and, with auth enabled, authenticate) the parent connection.
+        //    Without a token the first accepted connection is adopted. With a
+        //    token, the connection is held pending until its FIRST data-plane
+        //    frame proves the token; a missing/mismatched first frame drops the
+        //    connection and we keep listening for the real parent. The writer
+        //    task is only spawned post-adoption, so no child→parent frame is
+        //    ever written to an unauthenticated peer.
+        let (reader, write_half, frame_buffer, initial_frames) = loop {
+            let stream = listener.accept().await?;
+            let (mut reader, write_half) = stream.into_split();
 
-        // 7. Split stream into reader and writer
-        let (reader, write_half) = stream.into_split();
+            match &auth_token {
+                None => {
+                    break (
+                        reader,
+                        write_half,
+                        FrameBuffer::with_max_payload(max_payload_size),
+                        Vec::new(),
+                    );
+                }
+                Some(token) => {
+                    match Self::run_auth_handshake(&mut reader, token, max_payload_size).await {
+                        AuthOutcome::Adopted {
+                            frame_buffer,
+                            pending_frames,
+                        } => break (reader, write_half, frame_buffer, pending_frames),
+                        AuthOutcome::Rejected => {
+                            tracing::warn!(
+                                "Data-plane authentication failed; dropping connection \
+                                 and waiting for the parent"
+                            );
+                            // reader + write_half drop here, closing the socket.
+                            continue;
+                        }
+                    }
+                }
+            }
+        };
 
-        // 8. Spawn writer task (replaces Arc<Mutex<Writer>>)
+        // 7. Spawn writer task (replaces Arc<Mutex<Writer>>)
         let (writer, writer_task) = spawn_writer_task(write_half, writer_config);
 
-        // 9. Create handler semaphore
+        // 8. Create handler semaphore
         let handler_semaphore = Arc::new(Semaphore::new(max_concurrent_handlers));
 
-        // 10. Create active contexts map for ABORT handling
+        // 9. Create active contexts map for ABORT handling
         let active_contexts = Arc::new(RwLock::new(HashMap::new()));
 
-        // 11. Spawn read loop
+        // 10. Spawn read loop
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let registry = Arc::new(registry);
         let writer_clone = writer.clone();
@@ -297,7 +391,8 @@ impl Client {
                 writer_clone,
                 handler_semaphore,
                 active_contexts_clone,
-                max_payload_size,
+                frame_buffer,
+                initial_frames,
             )
             .await
             {
@@ -317,20 +412,30 @@ impl Client {
     }
 
     /// Main read loop - reads frames and dispatches to handlers.
+    ///
+    /// `frame_buffer` carries the configured `max_payload_size` (and, after an
+    /// auth handshake, any bytes already buffered past the AUTH frame), so an
+    /// oversized/invalid `payloadLength` makes `push` return an error here,
+    /// ending the loop and tearing down the connection without ever allocating
+    /// the giant buffer. `initial_frames` are frames that were pipelined after
+    /// the AUTH frame in the same packet and must be dispatched first.
     async fn read_loop<R: tokio::io::AsyncRead + Unpin>(
         mut reader: R,
         registry: Arc<HandlerRegistry>,
         writer: WriterHandle,
         semaphore: Arc<Semaphore>,
         active_contexts: Arc<RwLock<HashMap<u32, ActiveContext>>>,
-        max_payload_size: u32,
+        mut frame_buffer: FrameBuffer,
+        initial_frames: Vec<Frame>,
     ) -> Result<()> {
         use tokio::io::AsyncReadExt;
 
-        // Bound incoming frame sizes: an oversized/invalid `payloadLength` makes
-        // `push` return an error here, which ends the loop and tears down the
-        // connection without ever allocating the giant buffer.
-        let mut frame_buffer = FrameBuffer::with_max_payload(max_payload_size);
+        // Dispatch frames that arrived pipelined behind the AUTH frame before
+        // reading anything new from the socket.
+        for frame in initial_frames {
+            Self::dispatch_frame(&frame, &registry, &writer, &semaphore, &active_contexts).await;
+        }
+
         let mut buf = vec![0u8; 64 * 1024]; // 64KB read buffer
 
         loop {
@@ -348,6 +453,64 @@ impl Client {
                 Self::dispatch_frame(&frame, &registry, &writer, &semaphore, &active_contexts)
                     .await;
             }
+        }
+    }
+
+    /// Run the data-plane authentication handshake on a freshly accepted
+    /// connection.
+    ///
+    /// Reads from `reader` until the first complete frame is available. The
+    /// connection is adopted only if that first frame is an [`AUTH_METHOD_ID`]
+    /// frame whose payload equals `token` (compared in constant time). Any
+    /// frames pipelined after the AUTH frame in the same packet are returned for
+    /// normal dispatch. Anything else — a non-auth first frame, a token
+    /// mismatch, an oversized frame, a read error, or EOF — rejects the
+    /// connection so the caller can drop it and keep listening.
+    async fn run_auth_handshake<R: tokio::io::AsyncRead + Unpin>(
+        reader: &mut R,
+        token: &str,
+        max_payload_size: u32,
+    ) -> AuthOutcome {
+        use tokio::io::AsyncReadExt;
+
+        let mut frame_buffer = FrameBuffer::with_max_payload(max_payload_size);
+        let mut buf = vec![0u8; 64 * 1024];
+
+        loop {
+            let n = match reader.read(&mut buf).await {
+                Ok(0) => return AuthOutcome::Rejected, // closed before authenticating
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::debug!("Auth handshake read error: {}", e);
+                    return AuthOutcome::Rejected;
+                }
+            };
+
+            let mut frames = match frame_buffer.push(&buf[..n]) {
+                Ok(frames) => frames,
+                Err(e) => {
+                    // Oversized/invalid first frame: drop without allocating.
+                    tracing::debug!("Auth handshake framing error: {}", e);
+                    return AuthOutcome::Rejected;
+                }
+            };
+
+            if frames.is_empty() {
+                continue; // need more bytes for the first complete frame
+            }
+
+            // The FIRST frame must be a matching AUTH frame.
+            let first = frames.remove(0);
+            if first.header.method_id == AUTH_METHOD_ID
+                && constant_time_eq(&first.payload, token.as_bytes())
+            {
+                return AuthOutcome::Adopted {
+                    frame_buffer,
+                    pending_frames: frames,
+                };
+            }
+
+            return AuthOutcome::Rejected;
         }
     }
 
@@ -376,6 +539,13 @@ impl Client {
                     header.request_id
                 );
             }
+            return;
+        }
+
+        // A stray AUTH frame on an already-adopted connection is a no-op: auth
+        // is a one-time gate (handled before adoption), never a regular method.
+        if header.method_id == AUTH_METHOD_ID {
+            tracing::debug!("Ignoring stray AUTH frame on adopted connection");
             return;
         }
 
@@ -611,6 +781,135 @@ mod tests {
         // u32::MAX (~4 GiB) must be clamped to the absolute ceiling (~2 GiB - 1).
         let builder = Client::builder().max_payload_size(u32::MAX);
         assert_eq!(builder.max_payload_size, ABSOLUTE_MAX_PAYLOAD_SIZE);
+    }
+
+    #[test]
+    fn test_builder_auth_token_default_none() {
+        let builder = Client::builder();
+        assert!(builder.auth_token.is_none());
+    }
+
+    #[test]
+    fn test_builder_auth_token_set() {
+        let builder = Client::builder().auth_token("secret-token");
+        assert_eq!(builder.auth_token.as_deref(), Some("secret-token"));
+    }
+
+    #[test]
+    fn test_constant_time_eq() {
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab")); // length mismatch
+        assert!(!constant_time_eq(b"ab", b"abc")); // length mismatch
+        let token = "a".repeat(64);
+        assert!(constant_time_eq(token.as_bytes(), token.as_bytes()));
+    }
+
+    /// Build raw bytes for an AUTH frame carrying `token`.
+    fn auth_frame_bytes(token: &[u8]) -> Vec<u8> {
+        let header = Header::new(AUTH_METHOD_ID, 0, 0, token.len() as u32);
+        let mut bytes = header.encode().to_vec();
+        bytes.extend_from_slice(token);
+        bytes
+    }
+
+    #[tokio::test]
+    async fn test_auth_handshake_accepts_matching_token() {
+        use tokio::io::AsyncWriteExt;
+
+        let token = "deadbeef".repeat(8); // 64-char hex-like token
+        let (mut parent, mut child) = tokio::io::duplex(4096);
+        parent
+            .write_all(&auth_frame_bytes(token.as_bytes()))
+            .await
+            .unwrap();
+
+        let outcome =
+            Client::run_auth_handshake(&mut child, &token, DEFAULT_MAX_PAYLOAD_SIZE).await;
+
+        match outcome {
+            AuthOutcome::Adopted { pending_frames, .. } => {
+                assert!(pending_frames.is_empty());
+            }
+            AuthOutcome::Rejected => panic!("expected adoption with a matching token"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_auth_handshake_rejects_wrong_token() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut parent, mut child) = tokio::io::duplex(4096);
+        parent
+            .write_all(&auth_frame_bytes(b"the-wrong-token"))
+            .await
+            .unwrap();
+
+        let outcome =
+            Client::run_auth_handshake(&mut child, "the-expected-token", DEFAULT_MAX_PAYLOAD_SIZE)
+                .await;
+
+        assert!(matches!(outcome, AuthOutcome::Rejected));
+    }
+
+    #[tokio::test]
+    async fn test_auth_handshake_rejects_non_auth_first_frame() {
+        use tokio::io::AsyncWriteExt;
+
+        // A normal request as the first frame must be rejected before adoption.
+        let payload = crate::codec::MsgPackCodec::encode(&"hi").unwrap();
+        let header = Header::new(1, 0, 7, payload.len() as u32);
+        let mut bytes = header.encode().to_vec();
+        bytes.extend_from_slice(&payload);
+
+        let (mut parent, mut child) = tokio::io::duplex(4096);
+        parent.write_all(&bytes).await.unwrap();
+
+        let outcome =
+            Client::run_auth_handshake(&mut child, "token", DEFAULT_MAX_PAYLOAD_SIZE).await;
+
+        assert!(matches!(outcome, AuthOutcome::Rejected));
+    }
+
+    #[tokio::test]
+    async fn test_auth_handshake_returns_pipelined_frames() {
+        use tokio::io::AsyncWriteExt;
+
+        let token = "token-1234";
+        let mut bytes = auth_frame_bytes(token.as_bytes());
+
+        // Pipeline a request right after the AUTH frame in the same packet.
+        let payload = crate::codec::MsgPackCodec::encode(&"hi").unwrap();
+        let header = Header::new(1, 0, 7, payload.len() as u32);
+        bytes.extend_from_slice(&header.encode());
+        bytes.extend_from_slice(&payload);
+
+        let (mut parent, mut child) = tokio::io::duplex(4096);
+        parent.write_all(&bytes).await.unwrap();
+
+        let outcome = Client::run_auth_handshake(&mut child, token, DEFAULT_MAX_PAYLOAD_SIZE).await;
+
+        match outcome {
+            AuthOutcome::Adopted { pending_frames, .. } => {
+                assert_eq!(pending_frames.len(), 1);
+                assert_eq!(pending_frames[0].method_id(), 1);
+                assert_eq!(pending_frames[0].request_id(), 7);
+            }
+            AuthOutcome::Rejected => panic!("expected adoption with pipelined request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_auth_handshake_rejects_on_eof() {
+        // Connection closes before sending the AUTH frame.
+        let (parent, mut child) = tokio::io::duplex(4096);
+        drop(parent); // EOF
+
+        let outcome =
+            Client::run_auth_handshake(&mut child, "token", DEFAULT_MAX_PAYLOAD_SIZE).await;
+
+        assert!(matches!(outcome, AuthOutcome::Rejected));
     }
 
     #[tokio::test]

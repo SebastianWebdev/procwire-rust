@@ -248,7 +248,7 @@ mod tests {
         assert_eq!(decoded, n);
 
         // f64
-        let n: f64 = 3.14159;
+        let n: f64 = 1.5_f64;
         let encoded = MsgPackCodec::encode(&n).unwrap();
         let decoded: f64 = MsgPackCodec::decode(&encoded).unwrap();
         assert!((decoded - n).abs() < f64::EPSILON);

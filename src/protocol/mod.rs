@@ -16,6 +16,6 @@ pub use frame_buffer::FrameBuffer;
 pub use header_pool::{encode_header_pooled, with_header_pool, HeaderPool};
 pub use wire_format::{
     decode_header, encode_header, encode_header_into, flags, validate_header, Header,
-    ABORT_METHOD_ID, ABSOLUTE_MAX_PAYLOAD_SIZE, DEFAULT_MAX_PAYLOAD_SIZE, HEADER_POOL_SIZE,
-    HEADER_SIZE, RESERVED_METHOD_ID,
+    ABORT_METHOD_ID, ABSOLUTE_MAX_PAYLOAD_SIZE, AUTH_METHOD_ID, DEFAULT_MAX_PAYLOAD_SIZE,
+    HEADER_POOL_SIZE, HEADER_SIZE, RESERVED_METHOD_ID,
 };

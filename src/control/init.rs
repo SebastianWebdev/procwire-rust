@@ -109,8 +109,13 @@ impl InitSchema {
     }
 }
 
-/// Protocol version string.
-pub const PROTOCOL_VERSION: &str = "2.0.0";
+/// Protocol version string reported in `$init`.
+///
+/// Procwire dropped the "v2" framing — the wire protocol is de facto `1.0.0`,
+/// which is exactly the value the Node/Bun reference client announces. The
+/// parent does not gate the handshake on this string, but matching it keeps the
+/// announced version consistent across implementations.
+pub const PROTOCOL_VERSION: &str = "1.0.0";
 
 /// Build the `$init` JSON-RPC message.
 ///
@@ -234,7 +239,7 @@ mod tests {
         assert_eq!(parsed["jsonrpc"], "2.0");
         assert_eq!(parsed["method"], "$init");
         assert_eq!(parsed["params"]["pipe"], "/tmp/test.sock");
-        assert_eq!(parsed["params"]["version"], "2.0.0");
+        assert_eq!(parsed["params"]["version"], "1.0.0");
     }
 
     #[test]
