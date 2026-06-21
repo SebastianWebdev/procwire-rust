@@ -55,11 +55,23 @@ generated from the commit messages, so write them well.
 
 Until these are done, the workflow will run but cannot publish or open PRs.
 
-1. **`CARGO_REGISTRY_TOKEN` secret.** Create a crates.io API token
-   (crates.io → Account Settings → API Tokens) scoped to **publish** for the
-   `procwire-client` crate, then add it under
-   **Settings → Secrets and variables → Actions → New repository secret** as
-   `CARGO_REGISTRY_TOKEN`.
+1. **Trusted Publishing on crates.io (OIDC — no token secret).** Publishing uses
+   [crates.io Trusted Publishing](https://crates.io/docs/trusted-publishing), the
+   same idea as npm's OIDC trusted publishing that the Node `procwire` repo uses:
+   instead of storing a long-lived API token, release-plz mints a short-lived
+   (~30 min) token via GitHub's OIDC at publish time. As an **owner** of the
+   `procwire-client` crate, open it on crates.io →
+   **Settings → Trusted Publishing → Add a new publisher (GitHub)** and enter:
+   - **Repository owner:** `SebastianWebdev`
+   - **Repository name:** `procwire-rust`
+   - **Workflow filename:** `release-plz.yml`
+   - **Environment:** leave empty (or set one and add a matching `environment:`
+     to the `release-plz-release` job for an extra approval gate).
+
+   The `id-token: write` permission on the `release-plz-release` job (already set
+   in [`release-plz.yml`](.github/workflows/release-plz.yml)) is what lets
+   release-plz perform the OIDC exchange. **No `CARGO_REGISTRY_TOKEN` secret is
+   required.**
 2. **Let Actions open PRs.** Under
    **Settings → Actions → General → Workflow permissions**, enable
    **"Allow GitHub Actions to create and approve pull requests"**. Without this,
