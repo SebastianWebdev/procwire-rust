@@ -1,0 +1,81 @@
+name: Release-plz
+
+# Automated publishing, modeled on the changesets flow used by the Node/Bun
+# `procwire` repo:
+#   1. Merge feature PRs (with conventional-commit messages) into `main`.
+#   2. `release-plz-pr` opens/updates a "release" PR that bumps the crate
+#      version and rewrites the changelog from those commits.
+#   3. Merging that release PR bumps the version on `main`, which makes
+#      `release-plz-release` run `cargo publish` + tag + GitHub Release.
+#
+# One-time setup is required before this works — see RELEASING.md
+# (crates.io Trusted Publishing for this repo + "Allow GitHub Actions to create
+# pull requests"). Publishing uses OIDC Trusted Publishing — no API token secret.
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  # Publish any crate whose Cargo.toml version is newer than the one on
+  # crates.io (i.e. right after a release PR is merged): cargo publish, push the
+  # git tag, and create the GitHub Release. A no-op when nothing changed.
+  release-plz-release:
+    name: Release-plz release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+      # OIDC: lets release-plz mint a short-lived crates.io token via Trusted
+      # Publishing instead of a long-lived CARGO_REGISTRY_TOKEN secret.
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Open/update the "release" PR that bumps the version and updates the
+  # changelog from the conventional commits merged since the last release.
+  release-plz-pr:
+    name: Release-plz PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    # Never run two PR updates at once; never cancel an in-flight one (so a
+    # release PR is not left half-written).
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
