@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0](https://github.com/SebastianWebdev/procwire-rust/compare/v1.0.0...v1.1.0) - 2026-06-21
+
+### Added
+
+- *(protocol)* align Rust client with post-audit Procwire (auth, v1.0.0, D6)
+- *(control)* Procwire v2 compatibility — heartbeat, shutdown, bounded frames
+
+### Fixed
+
+- *(repo)* stop ignoring tracked docs/ so release-plz can determine versions
+- *(transport)* resolve Windows-only compile error in named-pipe impl
+- *(transport)* make generate_pipe_path collision-free across platforms
+- *(deps)* bump bytes 1.11.0 -> 1.11.1 (RUSTSEC-2026-0007)
+
+### Other
+
+- *(release)* publish via crates.io Trusted Publishing (OIDC), drop token secret
+- align repository/homepage URLs to procwire-rust
+- *(release)* automate crates.io publishing with release-plz
+- bump MSRV to 1.85 to match edition2024 dependency requirement
+
 Aligns the Rust client with the post-audit ("Phase 4") Procwire protocol. See
 `docs/rust-client-compatibility.md` in `SebastianWebdev/procwire` for the
 authoritative change list.
