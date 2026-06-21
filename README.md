@@ -4,9 +4,9 @@
 [![Documentation](https://docs.rs/procwire-client/badge.svg)](https://docs.rs/procwire-client)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Rust client SDK for [Procwire](https://github.com/SebastianWebdev/procwire) v2.0 IPC protocol.
+Rust client SDK for the [Procwire](https://github.com/SebastianWebdev/procwire) IPC protocol (wire version `1.0.0`).
 
-This crate enables Rust workers (child processes) to communicate with a Node.js parent process running `@procwire/core` using a high-performance binary protocol.
+This crate enables Rust workers (child processes) to communicate with a Node.js (or Bun) parent process running `@procwire/core` using a high-performance binary protocol. It is wire-compatible with the post-audit ("Phase 4") Node/Bun client.
 
 ## Features
 
@@ -17,6 +17,9 @@ This crate enables Rust workers (child processes) to communicate with a Node.js 
 - **Type-safe**: Strongly typed handlers with Serde integration
 - **Streaming**: Support for chunked responses and backpressure
 - **Cancellation**: Full abort signal support with `CancellationToken`
+- **Liveness**: Answers the control-plane `$ping`/`$pong` heartbeat and shuts down gracefully on `$shutdown`
+- **Authentication**: Optional data-plane AUTH handshake (`PROCWIRE_TOKEN`) for `auth: true` parents
+- **Hardened framing**: Bounds incoming `payloadLength` and rejects malformed headers before allocating
 
 ## Installation
 
@@ -48,16 +51,16 @@ struct EchoResponse {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = ClientBuilder::new()
-        .method("echo", |ctx, payload: EchoRequest| async move {
+        .handle("echo", |payload: EchoRequest, ctx| async move {
             ctx.respond(&EchoResponse {
                 message: payload.message,
             })
             .await
         })
-        .build()
+        .start()
         .await?;
 
-    client.run().await?;
+    client.wait_for_shutdown().await?;
     Ok(())
 }
 ```
@@ -152,14 +155,41 @@ Handlers can respond to abort signals from the parent:
 })
 ```
 
+## Authentication (optional)
+
+When the parent enables auth (`spawnPolicy({ auth: true })`), it passes a
+per-spawn token to the child via the `PROCWIRE_TOKEN` environment variable and
+sends it as the first data-plane frame (an AUTH frame, method id `0xFFFE`). The
+client picks up `PROCWIRE_TOKEN` automatically and refuses to adopt a connection
+whose first frame is not a matching AUTH frame (compared in constant time):
+
+```rust
+// Nothing to do — PROCWIRE_TOKEN is read from the environment automatically.
+let client = ClientBuilder::new()
+    .handle("echo", |req: String, ctx| async move { ctx.respond(&req).await })
+    .start()
+    .await?;
+
+// Or wire the token explicitly (an explicit token wins over the env var):
+let client = ClientBuilder::new()
+    .auth_token("….")
+    .handle("echo", |req: String, ctx| async move { ctx.respond(&req).await })
+    .start()
+    .await?;
+```
+
+With auth disabled (the default), no token is present and connections are
+adopted on accept — fully compatible with non-auth parents.
+
 ## Configuration
 
 ```rust
 ClientBuilder::new()
-    .max_concurrent_handlers(256)  // Limit concurrent handler tasks
+    .max_concurrent_handlers(256)              // Limit concurrent handler tasks
+    .max_payload_size(64 * 1024 * 1024)        // Bound incoming frame payloads (default 1 GiB)
     .backpressure_timeout(Duration::from_secs(30))
-    .method("handler", |ctx, req| async move { /* ... */ })
-    .build()
+    .handle("handler", |req: String, ctx| async move { /* ... */ })
+    .start()
     .await?;
 ```
 

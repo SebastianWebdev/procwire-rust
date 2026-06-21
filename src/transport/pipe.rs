@@ -19,20 +19,47 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// Generate a unique pipe path for this process.
 ///
 /// Format:
-/// - Unix: `/tmp/procwire-{pid}-{random}.sock`
+/// - Unix: `{base}/procwire-{pid}-{random}.sock`
 /// - Windows: `\\.\pipe\procwire-{pid}-{random}`
+///
+/// On Unix the base directory is, in order of preference, `XDG_RUNTIME_DIR`
+/// (a per-user directory, mode `0700` on systemd hosts), then `TMPDIR`, then
+/// `/tmp`. This mirrors the audited Node/Bun client and prefers a private
+/// runtime dir over the world-writable `/tmp` as defense-in-depth for the data
+/// plane (alongside the optional AUTH handshake).
 pub fn generate_pipe_path() -> String {
     let pid = std::process::id();
     let rand: u64 = rand_u64();
 
     #[cfg(unix)]
     {
-        format!("/tmp/procwire-{}-{:x}.sock", pid, rand)
+        let base = unix_runtime_dir();
+        format!("{}/procwire-{}-{:x}.sock", base, pid, rand)
     }
 
     #[cfg(windows)]
     {
         format!(r"\\.\pipe\procwire-{}-{:x}", pid, rand)
+    }
+}
+
+/// Pick the base directory for Unix domain socket paths.
+///
+/// Honors `XDG_RUNTIME_DIR`, then `TMPDIR`, then falls back to `/tmp`. Trailing
+/// slashes are stripped so the caller can always join with a single `/`.
+#[cfg(unix)]
+fn unix_runtime_dir() -> String {
+    let raw = std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("TMPDIR").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "/tmp".to_string());
+
+    let trimmed = raw.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/tmp".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -337,7 +364,9 @@ mod tests {
 
         #[cfg(unix)]
         {
-            assert!(path.starts_with("/tmp/procwire-"));
+            // The base dir is configurable (XDG_RUNTIME_DIR/TMPDIR/tmp), so only
+            // assert on the stable filename component and extension.
+            assert!(path.contains("/procwire-"));
             assert!(path.ends_with(".sock"));
         }
 
@@ -345,6 +374,16 @@ mod tests {
         {
             assert!(path.starts_with(r"\\.\pipe\procwire-"));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_unix_runtime_dir_strips_trailing_slash() {
+        // Empty XDG_RUNTIME_DIR / TMPDIR must fall back to /tmp, and any base
+        // dir is normalized to have no trailing slash so paths join cleanly.
+        let dir = unix_runtime_dir();
+        assert!(!dir.is_empty());
+        assert!(dir == "/tmp" || !dir.ends_with('/'));
     }
 
     #[test]

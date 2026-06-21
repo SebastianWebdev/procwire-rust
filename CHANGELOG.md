@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Aligns the Rust client with the post-audit ("Phase 4") Procwire protocol. See
+`docs/rust-client-compatibility.md` in `SebastianWebdev/procwire` for the
+authoritative change list.
+
 ### Added
 
 - **Control-plane heartbeat**: child now reads newline-delimited JSON-RPC on
@@ -21,11 +25,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no giant allocation.
 - **Structured error responses**: `RequestContext::error_with()` sends an
   arbitrary `Serialize` error payload (e.g. `{ "message", "code" }`).
+- **Data-plane authentication (opt-in)**: support for the AUTH frame
+  (`AUTH_METHOD_ID = 0xFFFE`). When `PROCWIRE_TOKEN` is set (an `auth: true`
+  parent sets it) or `ClientBuilder::auth_token()` is used, the first data-plane
+  frame must be a matching AUTH frame (payload compared in constant time) before
+  the connection is adopted; a missing/mismatched first frame drops the
+  connection while the listener keeps waiting for the real parent. Frames
+  pipelined after AUTH are dispatched normally. With no token, connections are
+  adopted on accept (backward compatible). New `Header::is_auth()`.
+
+### Changed
+
+- **Protocol version string** in `$init` is now `"1.0.0"` (was `"2.0.0"`):
+  Procwire dropped the "v2" framing; this matches the Node/Bun reference client.
+- **Full receive-side header validation (D6)**: `FrameBuffer` now rejects
+  `methodId 0`, reserved flag bits (6–7), and payloads over the configured or
+  absolute maximum on every parsed frame — mirroring the TypeScript
+  `FrameBuffer` — and tears the connection down instead of dispatching.
+- **Hardened Unix socket path**: the data-plane socket now lives under
+  `XDG_RUNTIME_DIR`, then `TMPDIR`, then `/tmp` (was always `/tmp`), preferring a
+  per-user runtime directory as defense-in-depth.
 
 ### Notes
 
 - The control-plane reader runs on a dedicated OS thread so a blocking stdin
   read never keeps the async runtime or process alive.
+- The writer task is only spawned after a connection is adopted, so no
+  child→parent frame is ever written to an unauthenticated peer.
 
 ## [1.0.0] - 2026-02-03
 
@@ -74,4 +100,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MsgPack uses struct-as-map format for Node.js compatibility
 - STREAM_END frames always have empty payload
 
-[1.0.0]: https://github.com/SebastianWebdev/procwire-client-rs/releases/tag/v0.1.0
+[1.0.0]: https://github.com/SebastianWebdev/procwire-rust/releases/tag/v1.0.0

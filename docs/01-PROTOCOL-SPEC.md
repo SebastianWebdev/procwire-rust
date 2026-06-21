@@ -1,7 +1,14 @@
-# Procwire Protocol Specification v2.0
+# Procwire Protocol Specification (v1.0.0)
 
 > Dokument referencyjny dla implementacji klienta Rust.
 > Opisuje pełny protokół komunikacyjny między Parent (Node.js) a Client (Rust worker).
+>
+> **Wersja protokołu:** `1.0.0` (pole `params.version` w `$init`). Procwire
+> porzucił framing „v2” — protokół jest de facto v1. Po audycie „Phase 4”
+> dodano: heartbeat `$ping`/`$pong` (§2.4), graceful `$shutdown` (§2.5),
+> data-plane AUTH (§11) i walidację nagłówka po stronie odbioru (§12).
+> Zgodność na drucie z klientami Node/Bun jest byte-for-byte — patrz
+> `docs/rust-client-compatibility.md` w repo `SebastianWebdev/procwire`.
 
 ## 1. Przegląd Architektury
 
@@ -82,7 +89,7 @@ uruchomieniu pipe listenera, aby poinformować parenta o gotowości.
         "progress": { "id": 1 }
       }
     },
-    "version": "2.0.0"
+    "version": "1.0.0"
   }
 }
 ```
@@ -93,7 +100,7 @@ uruchomieniu pipe listenera, aby poinformować parenta o gotowości.
 |--------------------|----------|-------------------------------------------------------------|
 | `params.pipe`      | string   | Ścieżka do Unix Socket / Named Pipe (child nasłuchuje)     |
 | `params.schema`    | object   | Schemat metod i eventów obsługiwanych przez child           |
-| `params.version`   | string   | Wersja protokołu (`"2.0.0"`)                               |
+| `params.version`   | string   | Wersja protokołu (`"1.0.0"` — Procwire porzucił framing „v2”) |
 | `schema.methods`   | object   | Mapa `nazwa → { id: number, response: ResponseType }`      |
 | `schema.events`    | object   | Mapa `nazwa → { id: number }`                              |
 
@@ -127,12 +134,34 @@ Child może wysłać `$error` jeśli nie jest w stanie się zainicjalizować:
 }
 ```
 
-### 2.4. Przyszłe wiadomości kontrolne (jeszcze nie zaimplementowane w v2.0)
+### 2.4. Heartbeat: `$ping` / `$pong` (zaimplementowane)
 
-Zaplanowane, ale NIE WYMAGANE dla MVP klienta Rust:
+Parent z `spawnPolicy({ heartbeat: { intervalMs, timeoutMs } })` wysyła co
+`intervalMs` wiadomość `$ping` na **stdin** child i oczekuje `$pong` na **stdout**.
+Brak `$pong` w `timeoutMs` → parent traktuje child jako martwy i go zabija.
 
-- `$heartbeat` — ping/pong dla health check
-- `$shutdown` — graceful shutdown request
+```jsonc
+// parent → child (stdin)
+{"jsonrpc":"2.0","method":"$ping"}
+
+// child → parent (stdout) — natychmiastowy, bezstanowy odruch
+{"jsonrpc":"2.0","method":"$pong"}
+```
+
+**WYMAGANE:** Klient Rust odpowiada `$pong` na każdy `$ping` (patrz `control/stdin.rs`).
+
+### 2.5. Graceful shutdown: `$shutdown` (zaimplementowane)
+
+```jsonc
+// parent → child (stdin)
+{"jsonrpc":"2.0","method":"$shutdown","params":{}}
+```
+
+Child zamyka pipe + połączenie i kończy się szybko, zamiast czekać na
+force-kill po 5 s. W Rust kończy `wait_for_shutdown()` i pozwala `main` wyjść.
+
+> Reader kontrolny ignoruje każdą linię niezaczynającą się od `{` oraz nieznane
+> metody. **Nigdy nie pisz nie-JSON logów na stdout** — logi idą na stderr.
 
 ---
 
@@ -176,6 +205,7 @@ PAYLOAD: N bytes (zmienna długość, format zależy od codec)
 | `DEFAULT_MAX_PAYLOAD`   | 1,073,741,824     | 1 GB (konfigurowalny)             |
 | `ABSOLUTE_MAX_PAYLOAD`  | 2,147,483,647     | ~2 GB (limit Node.js Buffer)      |
 | `ABORT_METHOD_ID`       | 0xFFFF (65535)    | Zarezerwowany dla sygnału abort   |
+| `AUTH_METHOD_ID`        | 0xFFFE (65534)    | Zarezerwowany dla AUTH frame (§11) |
 | `HEADER_POOL_SIZE`      | 16                | Pula pre-alokowanych nagłówków    |
 
 ### 3.3. Flags Byte
@@ -206,6 +236,7 @@ Bit 6-7: reserved (MUSZĄ być 0)
 **Method ID (2 bytes, uint16 BE):**
 - Przydzielane dynamicznie podczas handshake — child definiuje mapowanie `nazwa → id` w schemacie
 - ID = 0 jest **zarezerwowane** (nie używać)
+- ID = 0xFFFE (65534) jest zarezerwowane dla **AUTH** (patrz §11)
 - ID = 0xFFFF (65535) jest zarezerwowane dla **ABORT**
 - Metody i eventy mają **oddzielne przestrzenie ID** (echo method id=1 i progress event id=1 nie kolidują, bo context rozróżnia: request z flags=0x00 vs event z flags=0x01 i requestId=0)
 
@@ -492,11 +523,15 @@ To oznacza:
 
 ## 10. Wymagania platformowe
 
-| Platforma | Pipe type                  | Path format                             |
-|-----------|----------------------------|-----------------------------------------|
-| Linux     | Unix Domain Socket         | `/tmp/procwire-{pid}-{rand}.sock`       |
-| macOS     | Unix Domain Socket         | `/tmp/procwire-{pid}-{rand}.sock`       |
-| Windows   | Named Pipe                 | `\\.\pipe\procwire-{pid}-{rand}`        |
+| Platforma | Pipe type                  | Path format                                   |
+|-----------|----------------------------|-----------------------------------------------|
+| Linux     | Unix Domain Socket         | `{XDG_RUNTIME_DIR\|TMPDIR\|/tmp}/procwire-{pid}-{rand}.sock` |
+| macOS     | Unix Domain Socket         | `{TMPDIR\|/tmp}/procwire-{pid}-{rand}.sock`   |
+| Windows   | Named Pipe                 | `\\.\pipe\procwire-{pid}-{rand}`              |
+
+> Base dir na Unix: `XDG_RUNTIME_DIR` (per-user, mode 0700), potem `TMPDIR`,
+> potem `/tmp`. Preferowanie prywatnego katalogu runtime nad world-writable `/tmp`
+> to defense-in-depth dla data plane (obok opcjonalnego AUTH — §11).
 
 Child MUSI:
 1. Wykryć platformę
@@ -504,3 +539,64 @@ Child MUSI:
 3. Nasłuchiwać na niej jako serwer
 4. Zaakceptować jedno połączenie od parenta
 5. Komunikować się na tym połączeniu do zamknięcia
+
+---
+
+## 11. Data-Plane Authentication (AUTH frame) — opcjonalne
+
+Parent z `spawnPolicy({ auth: true })` włącza uwierzytelnianie data plane:
+
+1. generuje per-spawn token kryptograficzny (`randomBytes(32).toString("hex")` —
+   64 znaki lowercase-hex),
+2. przekazuje go do child przez zmienną środowiskową **`PROCWIRE_TOKEN`**, oraz
+3. wysyła go jako **PIERWSZY frame** na data plane — **AUTH frame** — zaraz po
+   połączeniu, przed jakimkolwiek requestem/streamem.
+
+### AUTH frame — format
+
+Standardowy 11-bajtowy nagłówek; payload to **surowe bajty tokenu** (BEZ codec):
+
+```
+methodId      = 0xFFFE (AUTH_METHOD_ID)
+flags         = 0x00   (do child, nie response; bity 6-7 = 0)
+requestId     = 0
+payloadLength = długość tokenu w bajtach
+payload       = token, surowe bajty UTF-8 (bez MsgPack)
+```
+
+### Zachowanie child (Rust)
+
+- Na starcie odczytaj `PROCWIRE_TOKEN`. Jeśli **ustawiony** (niepusty):
+  - przyjęte połączenie jest „pending” — **pierwszy** frame MUSI być AUTH
+    (`methodId == 0xFFFE`) z payloadem **równym** tokenowi (porównanie
+    **stało-czasowe**); dopiero wtedy adoptuj połączenie,
+  - jeśli pierwszy frame to cokolwiek innego lub token się nie zgadza → **zamknij
+    połączenie** i nasłuchuj dalej na prawdziwego parenta,
+  - frame'y zapipeline'owane za AUTH w tym samym pakiecie są normalnie
+    dispatchowane po adopcji.
+- Jeśli `PROCWIRE_TOKEN` **nieustawiony** → adoptuj na accept (kompatybilne
+  wstecz z parentami bez auth).
+- Stray AUTH frame na już zaadoptowanym połączeniu = no-op.
+
+> Writer task jest uruchamiany dopiero po adopcji — żaden frame child→parent nie
+> trafi do nieuwierzytelnionego peera.
+
+API Rust: `ClientBuilder::auth_token(token)` (jawny token wygrywa nad
+`PROCWIRE_TOKEN`). Implementacja: `client.rs` (`run_auth_handshake`,
+`constant_time_eq`).
+
+---
+
+## 12. Walidacja nagłówka po stronie odbioru (D6)
+
+Każdy sparsowany frame jest walidowany na warstwie framingu (zarówno parent jak
+i child), zanim payload zostanie zaalokowany:
+
+- `methodId == 0` → **odrzuć** (zarezerwowane); `0xFFFE`/`0xFFFF` są dozwolone,
+- `payloadLength > maxPayloadSize` (konfigurowalny) → **odrzuć**, zerwij połączenie
+  (zapobiega DoS/OOM, bo `payloadLength` jest kontrolowany przez peera),
+- `payloadLength > ABSOLUTE_MAX_PAYLOAD` (~2 GiB − 1) → **odrzuć**,
+- zarezerwowane bity flag (6-7) ≠ 0 → **odrzuć**.
+
+Implementacja: `protocol/wire_format.rs` (`Header::validate`) wywoływana z
+`protocol/frame_buffer.rs` na każdym frame.

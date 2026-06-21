@@ -25,6 +25,15 @@ pub const ABSOLUTE_MAX_PAYLOAD_SIZE: u32 = 2_147_483_647;
 /// Reserved method ID for ABORT signal.
 pub const ABORT_METHOD_ID: u16 = 0xFFFF;
 
+/// Reserved method ID for the data-plane authentication handshake.
+///
+/// When the parent enables auth (`spawnPolicy({ auth: true })`), it sends exactly
+/// one AUTH frame (`method_id = this`, `request_id = 0`, payload = the shared
+/// token bytes) as the **first** frame on the data plane; the child must validate
+/// it before adopting the connection. Like [`ABORT_METHOD_ID`], it cannot be used
+/// for a regular method.
+pub const AUTH_METHOD_ID: u16 = 0xFFFE;
+
 /// Reserved method ID (never use).
 pub const RESERVED_METHOD_ID: u16 = 0;
 
@@ -72,7 +81,7 @@ pub mod flags {
 /// Decoded header from wire format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
-    /// Method identifier (1-65534, 0 reserved, 0xFFFF = abort).
+    /// Method identifier (1-65533, 0 reserved, 0xFFFE = auth, 0xFFFF = abort).
     pub method_id: u16,
     /// Flags byte (see `flags` module).
     pub flags: u8,
@@ -152,10 +161,14 @@ impl Header {
 
     /// Validate the header for protocol compliance.
     ///
+    /// Mirrors the TypeScript `validateHeader` (D6) so that every frame parsed
+    /// off the wire is held to the same contract on both peers.
+    ///
     /// Checks:
-    /// - Method ID is not 0 (reserved)
-    /// - Payload length doesn't exceed max
-    /// - Reserved flag bits are 0
+    /// - Method ID is not 0 (reserved); `0xFFFE` (auth) and `0xFFFF` (abort) are allowed
+    /// - Payload length doesn't exceed the configured `max_payload_size`
+    /// - Payload length doesn't exceed [`ABSOLUTE_MAX_PAYLOAD_SIZE`] (interop cap)
+    /// - Reserved flag bits (6-7) are 0
     pub fn validate(&self, max_payload_size: u32) -> Result<()> {
         if self.method_id == RESERVED_METHOD_ID {
             return Err(ProcwireError::Protocol(
@@ -167,6 +180,13 @@ impl Header {
             return Err(ProcwireError::Protocol(format!(
                 "Payload size {} exceeds maximum {}",
                 self.payload_length, max_payload_size
+            )));
+        }
+
+        if self.payload_length > ABSOLUTE_MAX_PAYLOAD_SIZE {
+            return Err(ProcwireError::Protocol(format!(
+                "Payload size {} exceeds absolute maximum {}",
+                self.payload_length, ABSOLUTE_MAX_PAYLOAD_SIZE
             )));
         }
 
@@ -183,6 +203,12 @@ impl Header {
     #[inline]
     pub fn is_abort(&self) -> bool {
         self.method_id == ABORT_METHOD_ID
+    }
+
+    /// Check if this is a data-plane authentication frame.
+    #[inline]
+    pub fn is_auth(&self) -> bool {
+        self.method_id == AUTH_METHOD_ID
     }
 
     /// Check if this is a response.
@@ -322,6 +348,31 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_method_id_auth_allowed() {
+        // The AUTH frame (0xFFFE) must pass header validation just like ABORT.
+        let header = Header::new(AUTH_METHOD_ID, 0, 0, 64);
+        let result = header.validate(DEFAULT_MAX_PAYLOAD_SIZE);
+        assert!(result.is_ok());
+        assert!(header.is_auth());
+        assert!(!header.is_abort());
+    }
+
+    #[test]
+    fn test_auth_method_id_value() {
+        // Must match the TypeScript AUTH_METHOD_ID exactly.
+        assert_eq!(AUTH_METHOD_ID, 0xFFFE);
+    }
+
+    #[test]
+    fn test_validate_payload_exceeds_absolute_max() {
+        // Even with a permissive configured limit, the absolute interop cap holds.
+        let header = Header::new(1, 0, 1, u32::MAX);
+        let result = header.validate(u32::MAX);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("absolute maximum"));
+    }
+
+    #[test]
     fn test_validate_payload_too_large() {
         let header = Header::new(1, 0, 1, 1_000_000);
         let result = header.validate(100); // Max 100 bytes
@@ -385,8 +436,9 @@ mod tests {
         let min_header = Header::new(1, 0, 0, 0);
         assert!(min_header.validate(DEFAULT_MAX_PAYLOAD_SIZE).is_ok());
 
-        // Maximum method ID before abort
-        let max_header = Header::new(0xFFFE, 0, u32::MAX, u32::MAX);
+        // Maximum method ID before abort (auth), maximal request id, and the
+        // largest payload length allowed by the absolute interop cap.
+        let max_header = Header::new(0xFFFE, 0, u32::MAX, ABSOLUTE_MAX_PAYLOAD_SIZE);
         assert!(max_header.validate(u32::MAX).is_ok());
     }
 

@@ -1,10 +1,14 @@
 //! # procwire-client
 //!
-//! Rust client SDK for [Procwire](https://github.com/SebastianWebdev/procwire) v2.0 IPC protocol.
+//! Rust client SDK for the [Procwire](https://github.com/SebastianWebdev/procwire)
+//! IPC protocol (wire version `1.0.0`).
 //!
 //! This crate enables Rust workers (child processes) to communicate with
-//! a Node.js parent process running `@procwire/core` using a high-performance
-//! binary protocol.
+//! a Node.js (or Bun) parent process running `@procwire/core` using a
+//! high-performance binary protocol. It is wire-compatible with the post-audit
+//! ("Phase 4") Node/Bun client: it answers the `$ping`/`$pong` heartbeat, shuts
+//! down gracefully on `$shutdown`, bounds incoming frame sizes, and supports the
+//! optional data-plane AUTH handshake (`PROCWIRE_TOKEN`).
 //!
 //! ## Features
 //!
@@ -42,16 +46,16 @@
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let client = ClientBuilder::new()
-//!         .method("echo", |ctx, payload: EchoRequest| async move {
+//!         .handle("echo", |payload: EchoRequest, ctx| async move {
 //!             ctx.respond(&EchoResponse {
 //!                 message: payload.message,
 //!             })
 //!             .await
 //!         })
-//!         .build()
+//!         .start()
 //!         .await?;
 //!
-//!     client.run().await?;
+//!     client.wait_for_shutdown().await?;
 //!     Ok(())
 //! }
 //! ```
@@ -70,7 +74,7 @@
 //! Handlers can check for abort signals from the parent:
 //!
 //! ```ignore
-//! .method("long_task", |ctx, _payload: ()| async move {
+//! .handle("long_task", |_payload: (), ctx| async move {
 //!     if ctx.is_cancelled() {
 //!         return Ok(());
 //!     }
