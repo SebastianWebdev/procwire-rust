@@ -100,4 +100,4 @@ authoritative change list.
 - MsgPack uses struct-as-map format for Node.js compatibility
 - STREAM_END frames always have empty payload
 
-[1.0.0]: https://github.com/SebastianWebdev/procwire-client-rs/releases/tag/v0.1.0
+[1.0.0]: https://github.com/SebastianWebdev/procwire-rust/releases/tag/v1.0.0

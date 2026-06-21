@@ -83,10 +83,10 @@ Until these are done, the workflow will run but cannot publish or open PRs.
   the version and changelog — no code change — so this is low-risk. If you want
   full CI on it, create a Personal Access Token (or GitHub App token) and use it
   as `GITHUB_TOKEN` in `release-plz.yml` instead of `secrets.GITHUB_TOKEN`.
-- **`repository` URL.** `Cargo.toml` currently points `repository`/`homepage` at
-  `…/procwire-client-rs`, but this code lives in `…/procwire-rust`. release-plz
-  creates the GitHub Release on the real repo (from the Actions context), but the
-  changelog/crates.io links use the `Cargo.toml` value — align it to the
-  canonical public repo before the next publish.
+- **`repository` URL.** `Cargo.toml` `repository`/`homepage` and the
+  `CHANGELOG.md` link footer point at `…/procwire-rust` (the repo this code lives
+  in), which is what release-plz uses for changelog/crates.io links. (Note:
+  `CLAUDE.md` still refers to `procwire-client-rs` as the project's GitHub home —
+  align that too if `procwire-rust` is the canonical public repo.)
 - **Action version.** `release-plz/action@v0.5` tracks the latest `0.5.x`. Pin to
   an exact `@v0.5.NNN` if you prefer fully reproducible runs.
