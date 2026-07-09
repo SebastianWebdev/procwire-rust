@@ -332,8 +332,18 @@ Parent                                  Child (Rust)
   │                                        │
 ```
 
-**Flags error:** `0x07` = DIRECTION_TO_PARENT (0x01) | IS_RESPONSE (0x02) | IS_ERROR (0x04)
-**Payload error:** Zakodowany string z komunikatem błędu (przez codec, domyślnie MsgPack).
+**Flags error (metoda `result`/`ack`):** `0x07` = DIRECTION_TO_PARENT (0x01) | IS_RESPONSE (0x02) | IS_ERROR (0x04)
+**Flags error (metoda `stream`):** `0x0F` = powyższe + IS_STREAM (0x08) — **wymagane**. Bez IS_STREAM parent
+kieruje ramkę do tabeli oczekujących requestów zamiast streamów, nie znajduje dopasowania i porzuca ją,
+a konsument streamu (bez timeoutu) wisi w nieskończoność.
+
+**Payload error:** komunikat zakodowany **zawsze stałym kodekiem MsgPack** — niezależnie od kodeka danych
+metody (raw/arrow nie zakodują stringa). Zalecany zwykły string (MsgPack `str`); opcjonalnie mapa
+`{ "message": "...", "code": ... }` — parent wystawia `.message`, a cały obiekt trafia na `error.data`.
+
+**Ramka błędu jest TERMINALNA:** sama kończy request/stream. Nie ustawiaj na niej STREAM_END i nie wysyłaj
+po niej żadnych kolejnych ramek (chunk, STREAM_END, druga odpowiedź) dla tego samego `requestId`.
+Stream kończy się **albo** ramką STREAM_END, **albo** ramką błędu — nigdy obiema.
 
 ### 4.5. Event (child → parent)
 

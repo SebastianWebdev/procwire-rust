@@ -190,6 +190,14 @@ impl HandlerRegistry {
         self.methods.get(name).map(|e| e.response_type)
     }
 
+    /// Get response type for a method by ID.
+    pub fn get_response_type_by_id(&self, id: u16) -> Option<ResponseType> {
+        self.id_to_name
+            .get(&id)
+            .and_then(|name| self.methods.get(name))
+            .map(|e| e.response_type)
+    }
+
     /// Build an InitSchema from the registered methods and events.
     pub fn build_schema(&self) -> InitSchema {
         let mut schema = InitSchema::new();
