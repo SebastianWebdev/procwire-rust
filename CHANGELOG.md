@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0](https://github.com/SebastianWebdev/procwire-rust/compare/v1.1.1...v2.0.0) - 2026-07-09
+
+### Fixed
+
+- *(handler)* make stream error frames carry IS_STREAM and errors terminal
+
+### Other
+
+- *(deps)* bump crossbeam-epoch 0.9.18 -> 0.9.20 (RUSTSEC-2026-0204)
+
 ## [1.1.1](https://github.com/SebastianWebdev/procwire-rust/compare/v1.1.0...v1.1.1) - 2026-06-24
 
 ### Other
