@@ -29,6 +29,11 @@ pub enum ProcwireError {
     #[error("Handler not found for method ID: {0}")]
     HandlerNotFound(u16),
 
+    /// A terminal response (`respond`/`ack`/`end`/`error`) was already sent
+    /// for this request; a request/stream must have exactly one.
+    #[error("Response already sent for this request")]
+    ResponseAlreadySent,
+
     /// Connection closed unexpectedly.
     #[error("Connection closed")]
     ConnectionClosed,

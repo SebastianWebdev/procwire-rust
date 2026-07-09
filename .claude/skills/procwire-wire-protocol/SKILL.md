@@ -55,6 +55,7 @@ Pre-combined constants live in `protocol::flags`:
 |------------------------|-------|---------------------------------------------------|
 | `RESPONSE`             | 0x03  | TO_PARENT \| IS_RESPONSE                           |
 | `ERROR_RESPONSE`       | 0x07  | TO_PARENT \| IS_RESPONSE \| IS_ERROR              |
+| `STREAM_ERROR_RESPONSE`| 0x0F  | TO_PARENT \| IS_RESPONSE \| IS_ERROR \| IS_STREAM |
 | `STREAM_CHUNK`         | 0x0B  | TO_PARENT \| IS_RESPONSE \| IS_STREAM            |
 | `STREAM_END_RESPONSE`  | 0x1B  | TO_PARENT \| IS_RESPONSE \| IS_STREAM \| STREAM_END |
 | `ACK_RESPONSE`         | 0x23  | TO_PARENT \| IS_RESPONSE \| IS_ACK              |
@@ -68,7 +69,8 @@ Request  → Result:   request flags=0x00          → response flags=0x03
 Request  → ACK:      request flags=0x00          → response flags=0x23
 Request  → Stream:   request flags=0x00          → chunks flags=0x0B,
                                                     end flags=0x1B (EMPTY payload!)
-Error response:                                     flags=0x07
+Error response (result/ack method):                 flags=0x07
+Error response (stream method):                     flags=0x0F (MUST set IS_STREAM)
 Event (child→parent):                               flags=0x01, requestId=0
 Abort (parent→child):                methodId=0xFFFF, empty payload, requestId=target
 Auth (parent→child, first frame):    methodId=0xFFFE, flags=0x00, requestId=0,
@@ -78,6 +80,17 @@ Auth (parent→child, first frame):    methodId=0xFFFE, flags=0x00, requestId=0,
 Inbound requests from the parent carry `flags=0x00`. The client **ignores any
 inbound frame with `IS_RESPONSE` set** (`Client::dispatch_frame`) — it only
 handles requests.
+
+Error-frame rules (child → parent):
+- A `stream` method's error frame MUST carry `IS_STREAM` (0x0F, `STREAM_ERROR_RESPONSE`);
+  without it the parent looks the frame up in its pending-request table, misses,
+  drops it, and the stream consumer hangs forever (streams have no timeout).
+  `RequestContext` picks 0x07 vs 0x0F from the method's `ResponseType`.
+- The error payload is **always fixed MsgPack** (a plain string, or a map like
+  `{message, code}`) — never the method's data codec.
+- The error frame is **terminal**: never set STREAM_END on it, and never send
+  another frame (chunk/end/response) for the same `requestId` after it. A stream
+  ends with either STREAM_END or an error frame — never both.
 
 ## Reserved IDs
 

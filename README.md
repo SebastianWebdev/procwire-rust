@@ -125,6 +125,12 @@ ctx.end().await?;
 ctx.error("Something went wrong").await?;
 ```
 
+The error frame is **terminal** — don't call `ctx.end()` after it (a stream ends
+with either `end()` or `error()`, never both). For `stream` methods the frame is
+automatically tagged with `IS_STREAM` so the parent fails the pending stream
+instead of dropping the frame. A handler that returns `Err(...)` without having
+responded sends an error response to the parent automatically.
+
 ## Events (Fire-and-Forget)
 
 Send events to the parent process:

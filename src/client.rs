@@ -582,10 +582,18 @@ impl Client {
             );
         }
 
-        // Create context for handler with the cancellation token
+        // Create context for handler with the cancellation token. The method's
+        // response type makes ctx.error() tag stream errors with IS_STREAM —
+        // without it the parent routes the error frame to its pending-request
+        // table and the stream consumer hangs forever. An unknown method id
+        // falls back to Result (plain 0x07 error), matching the Node client.
+        let response_type = registry
+            .get_response_type_by_id(header.method_id)
+            .unwrap_or(ResponseType::Result);
         let ctx = RequestContext::with_writer_and_token(
             header.method_id,
             header.request_id,
+            response_type,
             writer.clone(),
             cancellation_token,
         );
@@ -604,10 +612,19 @@ impl Client {
             // Permit is held until this task completes
             let _permit = permit;
 
-            match registry.dispatch(method_id, &payload, ctx).await {
+            match registry.dispatch(method_id, &payload, ctx.clone()).await {
                 Ok(()) => {}
                 Err(e) => {
                     tracing::error!("Handler error for method {}: {}", method_id, e);
+                    // Tell the parent instead of leaving the request pending:
+                    // a request would only fail via its 30s timeout, a stream
+                    // (no timeout) would hang forever. Skipped if the handler
+                    // already sent a terminal response.
+                    if !ctx.has_responded() {
+                        if let Err(send_err) = ctx.error(&e.to_string()).await {
+                            tracing::debug!("Failed to send error response: {}", send_err);
+                        }
+                    }
                 }
             }
 
@@ -910,6 +927,141 @@ mod tests {
             Client::run_auth_handshake(&mut child, "token", DEFAULT_MAX_PAYLOAD_SIZE).await;
 
         assert!(matches!(outcome, AuthOutcome::Rejected));
+    }
+
+    /// Read frames from the far end of a duplex pipe until `count` are parsed.
+    async fn read_frames<R: tokio::io::AsyncRead + Unpin>(
+        reader: &mut R,
+        count: usize,
+    ) -> Vec<Frame> {
+        use tokio::io::AsyncReadExt;
+
+        let mut frame_buffer = FrameBuffer::new();
+        let mut frames = Vec::new();
+        let mut buf = vec![0u8; 4096];
+        while frames.len() < count {
+            let n = reader.read(&mut buf).await.expect("read failed");
+            assert!(n > 0, "connection closed before frames arrived");
+            frames.extend(frame_buffer.push(&buf[..n]).expect("framing error"));
+        }
+        frames
+    }
+
+    /// Dispatch one request frame against `registry` and return the parent-side
+    /// stream to read the child's frames from, plus the writer handle/task that
+    /// must stay alive for the duration of the test.
+    async fn dispatch_request(
+        registry: HandlerRegistry,
+        method_id: u16,
+        request_id: u32,
+        payload: Vec<u8>,
+    ) -> (
+        tokio::io::DuplexStream,
+        WriterHandle,
+        JoinHandle<Result<()>>,
+    ) {
+        let registry = Arc::new(registry);
+        let (client, server) = tokio::io::duplex(4096);
+        let (writer, task) =
+            crate::writer::spawn_writer_task(client, crate::writer::WriterConfig::default());
+        let semaphore = Arc::new(Semaphore::new(256));
+        let active_contexts = Arc::new(RwLock::new(HashMap::new()));
+
+        let header = Header::new(method_id, 0, request_id, payload.len() as u32);
+        let frame = Frame::new(header, Bytes::from(payload));
+
+        Client::dispatch_frame(&frame, &registry, &writer, &semaphore, &active_contexts).await;
+        (server, writer, task)
+    }
+
+    #[tokio::test]
+    async fn test_failing_handler_sends_error_response() {
+        let mut registry = HandlerRegistry::new();
+        registry.register("boom", ResponseType::Result, |_: (), _ctx| async {
+            Err(ProcwireError::Protocol("handler exploded".to_string()))
+        });
+        let method_id = registry.get_method_id("boom").unwrap();
+        let payload = MsgPackCodec::encode(&()).unwrap();
+
+        let (mut server, _writer, _task) = dispatch_request(registry, method_id, 42, payload).await;
+        let frames = read_frames(&mut server, 1).await;
+
+        let header = &frames[0].header;
+        assert_eq!(header.flags, flags::ERROR_RESPONSE); // 0x07
+        assert_eq!(header.method_id, method_id);
+        assert_eq!(header.request_id, 42);
+        let message: String = MsgPackCodec::decode(&frames[0].payload).unwrap();
+        assert!(message.contains("handler exploded"));
+    }
+
+    #[tokio::test]
+    async fn test_failing_stream_handler_sends_stream_error_response() {
+        let mut registry = HandlerRegistry::new();
+        registry.register(
+            "boom",
+            ResponseType::Stream,
+            |_: (), ctx: RequestContext| async move {
+                ctx.chunk(&1i32).await?;
+                Err(ProcwireError::Protocol("stream exploded".to_string()))
+            },
+        );
+        let method_id = registry.get_method_id("boom").unwrap();
+        let payload = MsgPackCodec::encode(&()).unwrap();
+
+        let (mut server, _writer, _task) = dispatch_request(registry, method_id, 42, payload).await;
+        let frames = read_frames(&mut server, 2).await;
+
+        // First the chunk, then the error tagged with IS_STREAM (0x0F) so the
+        // parent fails the pending STREAM instead of dropping the frame.
+        assert_eq!(frames[0].header.flags, flags::STREAM_CHUNK);
+        let error_header = &frames[1].header;
+        assert_eq!(error_header.flags, flags::STREAM_ERROR_RESPONSE); // 0x0F
+        assert!(!error_header.is_stream_end()); // error frame is terminal by itself
+        let message: String = MsgPackCodec::decode(&frames[1].payload).unwrap();
+        assert!(message.contains("stream exploded"));
+    }
+
+    #[tokio::test]
+    async fn test_unknown_method_sends_error_response() {
+        let registry = HandlerRegistry::new(); // no handlers registered
+        let payload = MsgPackCodec::encode(&()).unwrap();
+
+        let (mut server, _writer, _task) = dispatch_request(registry, 99, 7, payload).await;
+        let frames = read_frames(&mut server, 1).await;
+
+        let header = &frames[0].header;
+        assert_eq!(header.flags, flags::ERROR_RESPONSE);
+        assert_eq!(header.method_id, 99);
+        assert_eq!(header.request_id, 7);
+        let message: String = MsgPackCodec::decode(&frames[0].payload).unwrap();
+        assert!(message.contains("99"));
+    }
+
+    #[tokio::test]
+    async fn test_no_error_frame_after_handler_already_responded() {
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        let mut registry = HandlerRegistry::new();
+        registry.register(
+            "late",
+            ResponseType::Result,
+            |_: (), ctx: RequestContext| async move {
+                ctx.respond(&"done").await?;
+                Err(ProcwireError::Protocol("after the fact".to_string()))
+            },
+        );
+        let method_id = registry.get_method_id("late").unwrap();
+        let payload = MsgPackCodec::encode(&()).unwrap();
+
+        let (mut server, _writer, _task) = dispatch_request(registry, method_id, 42, payload).await;
+        let frames = read_frames(&mut server, 1).await;
+        assert_eq!(frames[0].header.flags, flags::RESPONSE); // the respond()
+
+        // No error frame may follow the terminal response.
+        let mut buf = vec![0u8; 64];
+        let extra = tokio::time::timeout(Duration::from_millis(100), server.read(&mut buf)).await;
+        assert!(extra.is_err(), "unexpected extra frame after response");
     }
 
     #[tokio::test]

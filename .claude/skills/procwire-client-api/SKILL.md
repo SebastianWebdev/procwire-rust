@@ -65,8 +65,10 @@ Key points / gotchas:
   capture and mutate plain state — clone what you need per call (e.g. an
   `mpsc::Sender`, an `Arc<...>`) **inside** the closure before `async move`.
 - Use `()` as `T` for methods that take no payload (`|_: (), ctx| ...`).
-- A handler that returns `Err(...)` is logged; it does **not** auto-send an
-  error frame. To tell the parent, call `ctx.error(...)` explicitly.
+- A handler that returns `Err(...)` is logged **and**, if no terminal response
+  was sent yet, the runtime auto-sends an error frame with the error's message
+  (parity with the Node client). `ctx.error(...)` is still the way to control
+  the message; an unknown method id gets the same auto-error treatment.
 
 Sharing state into a handler (pattern from `examples/events.rs`):
 
@@ -94,15 +96,20 @@ let client = Client::builder()
 | `chunk(&T)`                  | 0x0B        | one stream chunk (MsgPack)               |
 | `chunk_raw(&[u8])` / `chunk_bytes(Bytes)` | 0x0B | stream chunk, raw / zero-copy     |
 | `end()`                      | 0x1B        | **stream terminator, empty payload**     |
-| `error(&str)`                | 0x07        | error, string reason                     |
-| `error_with(&T)`             | 0x07        | error, structured (`{message, code}`)    |
+| `error(&str)`                | 0x07 / 0x0F | error, string reason (stream methods get IS_STREAM → 0x0F) |
+| `error_with(&T)`             | 0x07 / 0x0F | error, structured (`{message, code}`)    |
 
 Rules:
 - **A `stream` handler must finish with `ctx.end()`** — it sends an empty
   STREAM_END frame; without it the parent's async iterator never completes.
 - Send exactly one terminal response per request (one `respond`/`ack`/`error`,
-  or a chunk sequence ending in `end`). There is no internal guard against
-  double-reply; the protocol expects one.
+  or a chunk sequence ending in `end`). Terminal methods are guarded: a second
+  `respond`/`ack`/`end`/`error` returns `ProcwireError::ResponseAlreadySent`
+  (shared across `clone()`s of the context; `chunk` is not terminal).
+- The error frame is terminal on its own: after `ctx.error(...)` do **not**
+  call `ctx.end()` — a stream ends with either STREAM_END or an error frame,
+  never both. Error payloads are always fixed MsgPack, regardless of the
+  method's data codec.
 - `respond_bytes` / `chunk_bytes` take `bytes::Bytes` for zero-copy hot paths.
 
 ## Events (fire-and-forget, child → parent)

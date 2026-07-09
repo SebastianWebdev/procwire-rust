@@ -70,6 +70,13 @@ pub mod flags {
     pub const RESPONSE: u8 = DIRECTION_TO_PARENT | IS_RESPONSE;
     /// Error response flags: to_parent + is_response + is_error = 0x07
     pub const ERROR_RESPONSE: u8 = DIRECTION_TO_PARENT | IS_RESPONSE | IS_ERROR;
+    /// Stream error response flags: to_parent + is_response + is_error + is_stream = 0x0F
+    ///
+    /// A `stream` method MUST answer errors with `IS_STREAM` set, or the parent
+    /// routes the frame to its pending-request table instead of the
+    /// pending-stream table, finds no match, drops it, and — because streams
+    /// have no timeout — the consumer hangs forever.
+    pub const STREAM_ERROR_RESPONSE: u8 = DIRECTION_TO_PARENT | IS_RESPONSE | IS_ERROR | IS_STREAM;
     /// Stream chunk flags: to_parent + is_response + is_stream = 0x0B
     pub const STREAM_CHUNK: u8 = DIRECTION_TO_PARENT | IS_RESPONSE | IS_STREAM;
     /// Stream end flags: to_parent + is_response + is_stream + stream_end = 0x1B
@@ -405,6 +412,9 @@ mod tests {
 
         // Error response: 0x07 = to_parent + is_response + is_error
         assert_eq!(flags::ERROR_RESPONSE, 0x07);
+
+        // Stream error response: 0x0F = to_parent + is_response + is_error + is_stream
+        assert_eq!(flags::STREAM_ERROR_RESPONSE, 0x0F);
 
         // Stream chunk: 0x0B = to_parent + is_response + is_stream
         assert_eq!(flags::STREAM_CHUNK, 0x0B);
